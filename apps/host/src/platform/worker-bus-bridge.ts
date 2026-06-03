@@ -1,19 +1,3 @@
-/**
- * worker-bus-bridge.ts
- *
- * Host-side factory that spawns one Web Worker per plugin compartment and
- * wires it into the existing PlatformEventBus.
- *
- * Responsibilities:
- *   - Spawn a Worker running plugin-worker.ts
- *   - Send it an "init" message with the plugin name, policy and source code
- *   - Forward "publish" messages from the worker into PlatformEventBus
- *   - Subscribe to the bus for topics the plugin wants and forward "deliver"
- *     messages back into the worker
- *   - Forward "log" messages to the host logger / log sinks
- *   - Expose terminate() so the host can kill a rogue worker instantly
- */
-
 import { PlatformEventBus } from "@poc/shared";
 import { policies, type CompartmentName } from "@poc/shared";
 import { hostLogger } from "@poc/shared";
@@ -31,18 +15,23 @@ export function spawnPluginWorker(args: {
   name: CompartmentName;
   platformBus: PlatformEventBus;
   pluginSource: string;
-  workerUrl?: URL;
+  /**
+   * A bundled Worker constructor produced by Rsbuild's ?worker import.
+   * Must be provided by the call site so Rsbuild can emit a proper worker
+   * chunk at build time. The bridge does not construct a URL itself —
+   * resolving a raw .ts path at runtime produces a file the browser cannot
+   * parse.
+   *
+   * Usage in main.ts:
+   *   import PluginWorker from "../workers/plugin-worker.ts?worker";
+   *   spawnPluginWorker({ ..., WorkerClass: PluginWorker });
+   */
+  WorkerClass: new () => Worker;
 }): WorkerHandle {
-  const { name, platformBus, pluginSource } = args;
+  const { name, platformBus, pluginSource, WorkerClass } = args;
 
   const policy = policies[name];
-
-  // Rsbuild bundles the worker via the ?worker query; in Node tests we
-  // skip actual Worker creation (Workers are a browser/Node18+ API and
-  // Vitest provides its own environment).
-  const workerUrl = args.workerUrl ?? new URL("../workers/plugin-worker.ts", import.meta.url);
-
-  const worker = new Worker(workerUrl, { type: "module" });
+  const worker = new WorkerClass();
 
   // ----------------------------------------------------------------
   // Ready promise — resolves on "ready", rejects on "error"
@@ -72,7 +61,6 @@ export function spawnPluginWorker(args: {
     }
 
     if (msg.type === "log") {
-      // Re-emit through the host logger so UI log sinks pick it up
       if (msg.level === "error") {
         hostLogger.error(`[worker:${msg.source}] ${msg.message}`);
       } else {
@@ -82,8 +70,6 @@ export function spawnPluginWorker(args: {
     }
 
     if (msg.type === "publish") {
-      // Worker plugin wants to publish — route through the real bus
-      // (validation + sanitization happens inside PlatformEventBus)
       try {
         platformBus.publish(msg.source, msg.topic as EventTopic, msg.payload);
       } catch (err) {
@@ -119,12 +105,7 @@ export function spawnPluginWorker(args: {
   // ----------------------------------------------------------------
   // Bootstrap the worker
   // ----------------------------------------------------------------
-  worker.postMessage({
-    type: "init",
-    name,
-    policy,
-    pluginSource,
-  });
+  worker.postMessage({ type: "init", name, policy, pluginSource });
 
   return {
     ready,

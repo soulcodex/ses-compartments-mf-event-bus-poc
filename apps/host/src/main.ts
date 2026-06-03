@@ -5,6 +5,11 @@ import { spawnPluginWorker } from "./platform/worker-bus-bridge.js";
 import { loadRemoteInCompartment, fetchRemoteSource } from "./platform/compartment-loader.js";
 import { createLogRenderer } from "./ui/render-log.js";
 
+// ?worker tells Rsbuild to bundle plugin-worker.ts as a separate worker chunk
+// and hand back a constructor. This is the only correct way to get a Worker
+// that the browser can actually load — a raw .ts URL would not be parseable.
+import PluginWorker from "./workers/plugin-worker.ts?worker";
+
 import catalogSource from "./plugins/catalog.plugin.js?raw";
 import cartSource from "./plugins/cart.plugin.js?raw";
 import maliciousSource from "./plugins/malicious.plugin.js?raw";
@@ -45,9 +50,8 @@ document.addEventListener("DOMContentLoaded", () => {
   async function runWorkerDemo() {
     renderer.append("host", "--- Happy Path (workers) ---");
     const platformBus = new PlatformEventBus();
-    const workerUrl = new URL("./workers/plugin-worker.ts", import.meta.url);
-    const catalogHandle = spawnPluginWorker({ name: "catalog", platformBus, pluginSource: catalogSource, workerUrl });
-    const cartHandle = spawnPluginWorker({ name: "cart", platformBus, pluginSource: cartSource, workerUrl });
+    const catalogHandle = spawnPluginWorker({ name: "catalog", platformBus, pluginSource: catalogSource, WorkerClass: PluginWorker });
+    const cartHandle = spawnPluginWorker({ name: "cart", platformBus, pluginSource: cartSource, WorkerClass: PluginWorker });
     await Promise.all([catalogHandle.ready, cartHandle.ready]);
     renderer.append("host", "both workers ready — triggering catalog:item-selected");
     platformBus.publish("host", "catalog:item-selected", { itemId: "sku_worker_42", quantity: 2 });
