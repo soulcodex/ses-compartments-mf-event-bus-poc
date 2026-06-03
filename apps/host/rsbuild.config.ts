@@ -2,6 +2,12 @@ import { defineConfig } from "@rsbuild/core";
 import { pluginModuleFederation } from "@module-federation/rsbuild-plugin";
 
 export default defineConfig({
+  server: {
+    port: 3000,
+    cors: {
+      origin: ["http://localhost:3000"],
+    },
+  },
   source: {
     entry: { index: "./src/main.ts" },
   },
@@ -15,9 +21,6 @@ export default defineConfig({
     pluginModuleFederation({
       name: "host",
       remotes: {
-        // In dev mode these point to running remote dev servers.
-        // The CompartmentLoader fetches these URLs as text — it does NOT
-        // use MF's standard script-injection loader.
         catalogRemote: "catalogRemote@http://localhost:3001/mf-manifest.json",
         cartRemote: "cartRemote@http://localhost:3002/mf-manifest.json",
       },
