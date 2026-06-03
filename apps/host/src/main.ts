@@ -63,21 +63,77 @@ document.addEventListener("DOMContentLoaded", () => {
 
   async function runMFDemo() {
     renderer.append("host", "--- MF Demo (compartment-loaded remotes) ---");
+
+    // IMPORTANT: The MF demo requires production-built remote artifacts.
+    //
+    // Dev server output includes HMR devtools, isomorphic-ws WebSocket clients,
+    // and source-map annotations injected by @module-federation/rsbuild-plugin.
+    // These devtools bundle isomorphic-ws whose .default constructor is
+    // undefined inside a SES Compartment (the module was evaluated in the host
+    // realm and its exports are not available as compartment endowments).
+    //
+    // Only production builds (pnpm build) produce clean IIFEs that can be
+    // evaluated inside a SES Compartment.
+    //
+    // To run this demo:
+    //   cd apps/catalog && pnpm build && npx serve dist -p 4001 --cors
+    //   cd apps/cart    && pnpm build && npx serve dist -p 4002 --cors
+    //
+    // The host will fetch from ports 4001/4002 (production artifacts).
+    const CATALOG_BASE = "http://localhost:4001";
+    const CART_BASE    = "http://localhost:4002";
+
+    renderer.append("host", `fetching production artifacts from ${CATALOG_BASE} and ${CART_BASE} ...`);
+
     const platformBus = new PlatformEventBus();
 
-    renderer.append("host", "fetching catalog remote from http://localhost:3001/remoteEntry.js ...");
-    const catalogEntrySource = await fetchRemoteSource("http://localhost:3001/remoteEntry.js").catch(() => null);
-    const cartEntrySource = await fetchRemoteSource("http://localhost:3002/remoteEntry.js").catch(() => null);
+    const [
+      catalogEntrySource, catalogManifest,
+      cartEntrySource,    cartManifest,
+    ] = await Promise.all([
+      fetchRemoteSource(`${CATALOG_BASE}/remoteEntry.js`).catch(() => null),
+      fetchRemoteSource(`${CATALOG_BASE}/mf-manifest.json`).catch(() => null),
+      fetchRemoteSource(`${CART_BASE}/remoteEntry.js`).catch(() => null),
+      fetchRemoteSource(`${CART_BASE}/mf-manifest.json`).catch(() => null),
+    ]);
 
     if (!catalogEntrySource || !cartEntrySource) {
-      renderer.append("host", "⚠ MF remotes not running. Start them with: pnpm dev:remotes");
+      renderer.append("host", "⚠  Production remotes not found.");
+      renderer.append("host", "   Build + serve them first:");
+      renderer.append("host", "   pnpm --filter @poc/catalog build");
+      renderer.append("host", "   pnpm --filter @poc/cart build");
+      renderer.append("host", "   npx serve apps/catalog/dist -p 4001 --cors");
+      renderer.append("host", "   npx serve apps/cart/dist    -p 4002 --cors");
       return;
     }
+
+    // Resolve the expose chunk path from the manifest (sync array = bundled chunk).
+    const resolveExposeChunk = async (manifestJson: string | null, baseUrl: string) => {
+      if (!manifestJson) return undefined;
+      try {
+        const manifest = JSON.parse(manifestJson);
+        const exposes = manifest?.exposes ?? [];
+        const pluginExpose = exposes.find((e: { path: string }) => e.path === "./plugin");
+        // Rsbuild puts the expose chunk in assets.js.sync (bundled with remoteEntry)
+        const chunkPath = pluginExpose?.assets?.js?.sync?.[0]
+                       ?? pluginExpose?.assets?.js?.async?.[0];
+        if (!chunkPath) return undefined;
+        return fetchRemoteSource(`${baseUrl}/${chunkPath}`).catch(() => undefined);
+      } catch { return undefined; }
+    };
+
+    const [catalogChunkSource, cartChunkSource] = await Promise.all([
+      resolveExposeChunk(catalogManifest, CATALOG_BASE),
+      resolveExposeChunk(cartManifest, CART_BASE),
+    ]);
+
+    renderer.append("host", "artifacts fetched — loading inside SES compartments ...");
 
     const catalogRemote = await loadRemoteInCompartment({
       name: "catalog",
       platformBus,
       sourceCode: catalogEntrySource,
+      exposeChunkSource: catalogChunkSource,
       containerName: "catalogRemote",
     });
 
@@ -85,17 +141,16 @@ document.addEventListener("DOMContentLoaded", () => {
       name: "cart",
       platformBus,
       sourceCode: cartEntrySource,
+      exposeChunkSource: cartChunkSource,
       containerName: "cartRemote",
     });
 
-    renderer.append("host", "both MF remotes loaded inside SES compartments");
+    renderer.append("host", "both MF remotes loaded inside SES compartments ✓");
 
-    // Trigger the catalog plugin if it exports a selectItem function
     const selectItem = catalogRemote.exports.selectItem as ((id: string, qty: number) => void) | undefined;
-    if (selectItem) {
+    if (typeof selectItem === "function") {
       selectItem("sku_mf_1", 1);
     } else {
-      // Publish directly via the bus
       platformBus.publish("host", "catalog:item-selected", { itemId: "sku_mf_1", quantity: 1 });
     }
 

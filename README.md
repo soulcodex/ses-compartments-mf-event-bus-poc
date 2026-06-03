@@ -12,6 +12,7 @@ through a host-owned event bus while preserving strict capability boundaries.
 - [Architecture](#architecture)
 - [Worker-based isolation](#worker-based-isolation)
 - [Module Federation + SES isolation](#module-federation--ses-isolation)
+- [SES + MF compatibility notes](./docs/ses-mf-compatibility.md)
 - [How it works](#how-it-works)
 - [Getting started](#getting-started)
 - [SES Compartments explained](#ses-compartments-explained)
@@ -51,6 +52,8 @@ through a host-owned event bus while preserving strict capability boundaries.
 - **Formal verification** — this is a conceptual demonstration, not a formally verified system
 - **Performance** — no benchmarks are included
 - **Full browser coverage** — some browser-specific globals may behave differently depending on lockdown options
+- **MF demo requires production artifacts** — dev server bundles include HMR devtools (`isomorphic-ws`) that fail inside a SES Compartment; only `rsbuild build` output is safe to evaluate
+- **Source transforms are version-coupled** — `sanitizeRemoteSource` targets `@module-federation/rsbuild-plugin@2.5.0`; a different MF or Rspack version may produce a bundle with different patterns requiring new transforms
 
 ---
 
@@ -345,32 +348,55 @@ instance, which requires passing that object through the endowments boundary
 — a non-trivial bridging problem. Remotes in this PoC are **logic-only plugins**
 with no UI framework dependency, so shared scoping is unnecessary.
 
+### SES + MF source compatibility
+
+Evaluating a real Rsbuild MF `remoteEntry.js` inside `Compartment.evaluate()`
+requires a source pre-processing step. Seven issues were encountered across the
+full investigation:
+
+| Issue | SES error / symptom | Root cause | Fix |
+|---|---|---|---|
+| 1 | `SES_DIRECT_EVAL` | `getSharedFallbackGetter` uses `eval()` for runtime code-gen | `eval(` → `(0,eval)(` |
+| 2 | `SES_IMPORT_REJECTED` | Remote-entry loader uses `Function("callbacks",\`import("${url}")\`)` | `import` → `__import__` (SES evasion) |
+| 3 | `TypeError` at runtime | `self`, `document`, `setTimeout` stripped by SES | Endow minimal no-op stubs |
+| 4 | `TypeError: hasOwnProperty on undefined` | `document.defaultView` returns `undefined`; MF calls `h(defaultView)` | Add `defaultView: globalThisProxy` to document stub |
+| 5 | `TypeError: Date.now() throws in secure mode` | SES locks `Date.now()` to prevent timing side-channels | Endow `Date: { now: () => 0 }` |
+| 6 | Container `undefined` after eval (silent) | Bare `catalogRemote=__webpack_exports__` swallowed by SES `with`-scope | Replace with `globalThis["catalogRemote"]=__webpack_exports__` |
+| 7 | `isomorphic_ws.default is not a constructor` | Dev server bundles inject HMR devtools (isomorphic-ws) absent from compartment | **Only evaluate production builds** (`pnpm build`, not `rsbuild dev`) |
+
+Full investigation with root causes, regex references, and rationale:
+**[docs/ses-mf-compatibility.md](./docs/ses-mf-compatibility.md)**
+
 ### Running the MF demo
 
-```bash
-# Terminal 1 — start catalog remote
-pnpm --filter @poc/catalog dev
+> **Important:** The MF demo requires **production-built** remote artifacts.
+> Dev server output (`rsbuild dev`) includes HMR devtools that fail inside
+> a SES Compartment. See [Issue 7](./docs/ses-mf-compatibility.md#issue-7----dev-server-bundles-contain-devtools-isomorphic-ws) for the full explanation.
 
-# Terminal 2 — start cart remote
-pnpm --filter @poc/cart dev
-
-# Terminal 3 — start host
-pnpm --filter @poc/host dev
-```
-
-Or use the convenience script:
+One command does everything — builds the remotes, serves them as static
+production artifacts, and starts the host dev server:
 
 ```bash
-# Start all three concurrently (requires concurrently or similar)
-pnpm dev:remotes &
-pnpm dev
+pnpm demo:mf
 ```
 
-Then click **📦 Run MF Demo** in the browser. The host will:
-1. Fetch `http://localhost:3001/remoteEntry.js` (catalog) as text
-2. Fetch `http://localhost:3002/remoteEntry.js` (cart) as text
-3. Evaluate each inside its own SES Compartment with a scoped bus endowment
-4. Trigger the event flow and log all communication
+What it runs under the hood:
+
+```
+pnpm build:remotes          # pnpm --filter @poc/catalog build
+                            # pnpm --filter @poc/cart build
+concurrently:
+  pnpm --filter @poc/catalog serve   # serve dist -p 4001 (production)
+  pnpm --filter @poc/cart serve      # serve dist -p 4002 (production)
+  pnpm --filter @poc/host dev        # rsbuild dev at :3000
+```
+
+Then open `http://localhost:3000` and click **📦 Run MF Demo**. The host will:
+1. Fetch `http://localhost:4001/remoteEntry.js` (catalog production build) as text
+2. Fetch `http://localhost:4002/remoteEntry.js` (cart production build) as text
+3. Sanitize each bundle (7 transforms — see compat notes)
+4. Evaluate each inside its own SES Compartment with a scoped bus endowment
+5. Trigger the event flow and log all communication
 
 ### What MF isolation proves
 
@@ -383,18 +409,19 @@ Then click **📦 Run MF Demo** in the browser. The host will:
 | MF globals do not leak               | Container registered on compartment globalThis, not window |
 | Payload hardening survives MF boundary| `structuredClone` + `harden` apply to MF-sourced payloads |
 
-### Test coverage (34 tests in `apps/host/tests/compartment-loader.test.ts`)
+### Test coverage (49 tests in `apps/host/tests/compartment-loader.test.ts`)
 
 | Group | What is tested |
 |---|---|
 | Container registration | Valid container extracted · missing container throws · missing `.get()` throws · custom `containerName` |
 | Plugin module loading | Factory returns exports · publish works · subscribe registers handler |
-| Capability isolation | No `process`, `fetch`, `window`, `document`, `XMLHttpRequest` · no host env leakage · cross-compartment variable isolation |
+| Capability isolation | No `process`, `fetch`, `window` · restricted `document` stub (no real DOM) · no host env leakage · cross-compartment variable isolation |
 | Bus capability enforcement | Allowed publish/subscribe · forbidden publish → PermissionDeniedError · forbidden subscribe → PermissionDeniedError · malicious remote fully blocked |
 | Payload integrity | Payload cloned · payload hardened · post-publish mutation ignored · receiver mutation throws |
 | Full integration | catalog→cart→catalog flow · cartSize accumulates · multiple sequential events |
 | Error and edge cases | Syntax error in source · factory throw caught · cleanup() removes subscriptions · empty source throws · invalid payload → Zod error |
 | MF container contract | `init()` called once · `get()` called with correct path · default modulePath · custom modulePath |
+| Source sanitization | `eval(` → indirect eval · `import(` → `__import__` · dot-prefix exclusion · spread prefix · all occurrences replaced · regression: eval in source evaluates · regression: import in source evaluates · bare global assignment fixed · no `"use strict"` prepend |
 
 ---
 
@@ -465,7 +492,7 @@ pnpm install
 pnpm demo:node
 ```
 
-**Run the browser demo**
+**Run the browser demo (in-thread + Worker scenarios)**
 
 ```bash
 pnpm dev
@@ -478,6 +505,35 @@ Open the URL printed by Rsbuild. Five buttons are available:
 - `Run Mutation Attack` — payload mutation after publish is ignored
 - `Run Worker Demo` — same happy-path flow, each compartment in its own Worker thread
 - `Clear Logs` — resets the log panel
+
+**Run the MF demo (Module Federation + SES Compartments)**
+
+```bash
+pnpm demo:mf
+```
+
+Builds production artifacts for both remotes, serves them statically, and
+starts the host dev server — all in one command. Then click **📦 Run MF Demo**.
+
+**Develop remotes alongside the host**
+
+```bash
+# Start catalog and cart dev servers concurrently (dev mode, HMR enabled)
+pnpm dev:remotes
+
+# In a separate terminal
+pnpm dev
+```
+
+> Note: `dev:remotes` starts the dev servers for MF hot-reload development.
+> The **📦 Run MF Demo** button requires production artifacts (`pnpm demo:mf`).
+
+**Build everything**
+
+```bash
+pnpm build          # builds all apps
+pnpm build:remotes  # builds only catalog + cart (faster, for demo:mf prep)
+```
 
 **Run tests**
 
@@ -615,6 +671,23 @@ compartments unless you intend to grant full DOM authority.
 Plugins in this PoC are evaluated as plain strings via `compartment.evaluate()`.
 They cannot use `import` statements. Full module graph support requires SES
 import hooks, which are more complex to configure correctly.
+
+### MF source transforms are version-coupled
+
+`sanitizeRemoteSource` applies textual transforms tuned for
+`@module-federation/rsbuild-plugin@2.5.0` + `ses@1.15.0`. If either package
+changes its IIFE shape, global-registration pattern, or eval/import usage, the
+transforms will need updating. The compatibility notes in
+[docs/ses-mf-compatibility.md](./docs/ses-mf-compatibility.md) document every
+assumption so that future updates can be made precisely.
+
+### MF dev artifacts cannot be evaluated
+
+`rsbuild dev` injects HMR devtools (`isomorphic-ws`, live manifest polling,
+source-map helpers) that are absent from compartment endowments and will crash
+at evaluation time. Only `pnpm build` output is suitable for the
+`CompartmentLoader`. This is also the correct security posture — never evaluate
+dev-mode instrumented code as a trust boundary.
 
 ---
 

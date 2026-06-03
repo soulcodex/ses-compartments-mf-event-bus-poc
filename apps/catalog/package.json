@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "rsbuild dev --port 3001",
-    "build": "rsbuild build"
+    "build": "rsbuild build",
+    "serve": "serve dist -p 4001 -C --no-port-switching"
   },
   "dependencies": {
     "@poc/shared": "workspace:*",
@@ -15,6 +16,7 @@
     "@module-federation/rsbuild-plugin": "^2.5.0",
     "@rsbuild/core": "^2.0.11",
     "@types/node": "^22.0.0",
+    "serve": "^13.0.4",
     "typescript": "^5.7.0"
   }
 }

@@ -5,11 +5,14 @@
   "scripts": {
     "dev": "pnpm --filter @poc/host dev",
     "build": "pnpm -r run build",
+    "build:remotes": "pnpm --filter @poc/catalog build && pnpm --filter @poc/cart build",
     "test": "pnpm -r run test && pnpm exec vitest run",
     "demo:node": "pnpm --filter @poc/host demo:node",
-    "dev:remotes": "pnpm --filter @poc/catalog dev & pnpm --filter @poc/cart dev"
+    "dev:remotes": "concurrently \"pnpm --filter @poc/catalog dev\" \"pnpm --filter @poc/cart dev\"",
+    "demo:mf": "pnpm build:remotes && concurrently \"pnpm --filter @poc/catalog serve\" \"pnpm --filter @poc/cart serve\" \"pnpm --filter @poc/host dev\""
   },
   "devDependencies": {
+    "concurrently": "^10.0.3",
     "vitest": "^3.2.6"
   },
   "dependencies": {
@@ -17,3 +20,4 @@
     "zod": "^3.25.76"
   }
 }
+
