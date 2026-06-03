@@ -10,6 +10,7 @@ through a host-owned event bus while preserving strict capability boundaries.
 - [What this PoC proves](#what-this-poc-proves)
 - [What this PoC does not prove](#what-this-poc-does-not-prove)
 - [Architecture](#architecture)
+- [Worker-based isolation](#worker-based-isolation)
 - [How it works](#how-it-works)
 - [Getting started](#getting-started)
 - [SES Compartments explained](#ses-compartments-explained)
@@ -34,6 +35,8 @@ through a host-owned event bus while preserving strict capability boundaries.
 | Receiver cannot mutate      | Hardened payload throws on write attempt                |
 | No ambient authority        | `process`, `fetch`, `window`, `document` not accessible |
 | Variable isolation          | Globals set in one compartment invisible in another     |
+| Worker availability         | Each worker runs in its own OS thread; main thread stays responsive |
+| Worker termination          | Host can call `terminate()` to kill a rogue plugin instantly |
 
 ---
 
@@ -106,6 +109,114 @@ catalog                    host                      cart
    │◄───────────────────────│                          │
    │  receive event         │                          │
 ```
+
+---
+
+## Worker-based isolation
+
+The in-thread compartments above share the main thread. A single infinite loop
+in a plugin freezes the entire page. The Worker mode adds a second isolation
+layer by running each compartment in a dedicated OS thread.
+
+### Architecture (Worker mode)
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  Main Thread — Host Platform                                             │
+│                                                                          │
+│  ┌─────────────────────────┐    ┌──────────────────────────────────────┐ │
+│  │    PlatformEventBus     │    │       WorkerBusBridge                │ │
+│  │                         │    │                                      │ │
+│  │  subscribe(topic)       │◄───│  spawnPluginWorker(name, source)     │ │
+│  │  publish(src, topic)    │    │  · spawns Worker per plugin          │ │
+│  │                         │    │  · sends init message                │ │
+│  └─────────────┬───────────┘    │  · forwards publish → bus            │ │
+│                │                │  · forwards bus events → worker      │ │
+│                │                │  · exposes terminate()               │ │
+│                │                └──────────────────────────────────────┘ │
+└────────────────┼─────────────────────────────────────────────────────────┘
+                 │  postMessage / onmessage  (structured-clone boundary)
+       ┌─────────┴─────────────────────────────┐
+       │                                       │
+       ▼                                       ▼
+┌──────────────────────────┐     ┌──────────────────────────┐
+│  Worker Thread           │     │  Worker Thread           │
+│  "catalog"               │     │  "cart"                  │
+│                          │     │                          │
+│  ┌────────────────────┐  │     │  ┌────────────────────┐  │
+│  │  SES lockdown()    │  │     │  │  SES lockdown()    │  │
+│  │                    │  │     │  │                    │  │
+│  │  Compartment       │  │     │  │  Compartment       │  │
+│  │  "catalog"         │  │     │  │  "cart"            │  │
+│  │                    │  │     │  │                    │  │
+│  │  bus  (scoped)     │  │     │  │  bus  (scoped)     │  │
+│  │  logger            │  │     │  │  logger            │  │
+│  └────────────────────┘  │     │  └────────────────────┘  │
+└──────────────────────────┘     └──────────────────────────┘
+```
+
+### Message protocol
+
+All cross-thread communication is serialised via `postMessage`. No shared
+memory is involved. The structured-clone algorithm enforces a hard data
+boundary between threads.
+
+```
+Worker → Host                      Host → Worker
+─────────────────────────────      ────────────────────────────────
+{ type: "publish",                 { type: "init",
+  topic, payload, source }           name, policy, pluginSource }
+
+{ type: "log",                     { type: "deliver",
+  level, source, message }           envelope }
+
+{ type: "ready", name }
+
+{ type: "error", source, message }
+```
+
+### Worker event flow
+
+```
+Worker "catalog"          Main Thread (host)          Worker "cart"
+       │                        │                           │
+       │  postMessage           │                           │
+       │  { type: "publish",    │                           │
+       │    topic, payload }    │                           │
+       │───────────────────────►│                           │
+       │                        │  PlatformEventBus         │
+       │                        │  validate + clone         │
+       │                        │  + harden                 │
+       │                        │  postMessage              │
+       │                        │  { type: "deliver",       │
+       │                        │    envelope }             │
+       │                        │──────────────────────────►│
+       │                        │                           │  SES Compartment
+       │                        │                           │  handler runs
+       │                        │                           │  postMessage
+       │                        │                           │  { type: "publish",
+       │                        │                           │    topic, payload }
+       │                        │◄──────────────────────────│
+       │                        │  PlatformEventBus         │
+       │                        │  validate + clone         │
+       │                        │  + harden                 │
+       │                        │  postMessage              │
+       │                        │  { type: "deliver" }      │
+       │◄───────────────────────│                           │
+       │  SES Compartment       │                           │
+       │  handler runs          │                           │
+```
+
+### What worker isolation adds
+
+| Property                  | In-thread compartments    | Worker compartments               |
+|---------------------------|---------------------------|-----------------------------------|
+| Capability isolation      | ✅ SES scoped bus          | ✅ SES scoped bus (same)           |
+| Payload immutability      | ✅ harden()                | ✅ structuredClone (postMessage)   |
+| Thread isolation          | ❌ shares main thread      | ✅ dedicated OS thread             |
+| Main thread blocking      | ❌ plugin can block UI     | ✅ plugin cannot block main thread |
+| Instant plugin kill       | ❌ not possible in-thread  | ✅ worker.terminate()              |
+| Shared memory risk        | ⚠️ possible via endowments | ✅ postMessage boundary enforces it|
 
 ---
 
@@ -182,11 +293,12 @@ pnpm demo:node
 pnpm dev
 ```
 
-Open the URL printed by Vite. Four buttons are available:
+Open the URL printed by Rsbuild. Five buttons are available:
 
-- `Run Happy Path` — catalog → cart → catalog full flow
+- `Run Happy Path` — catalog → cart → catalog full flow (in-thread)
 - `Run Malicious Plugin` — blocked publish and subscribe attempts
 - `Run Mutation Attack` — payload mutation after publish is ignored
+- `Run Worker Demo` — same happy-path flow, each compartment in its own Worker thread
 - `Clear Logs` — resets the log panel
 
 **Run tests**
@@ -290,13 +402,17 @@ bus.subscribe("catalog:item-selected", (event) => {
 ### SES is not an availability boundary
 
 SES prevents capability leakage but does not prevent resource exhaustion.
-A compartment can still:
+A compartment running in-thread can still:
 
 - run an infinite loop and block the thread
 - allocate unbounded memory
 - call `bus.publish` in a tight loop flooding subscribers
 
-Use Worker threads or process isolation for availability guarantees.
+The Worker mode in this PoC addresses thread blocking — each plugin runs in
+its own OS thread and can be terminated instantly. However Workers still share
+the process memory space, so memory exhaustion and CPU quotas remain unsolved.
+Use process isolation (e.g. separate Node processes, iframes with CSP) for
+stronger availability guarantees.
 
 ### Endowed functions are authority
 
@@ -328,7 +444,7 @@ import hooks, which are more complex to configure correctly.
 
 | Improvement                 | Description                                                       |
 | --------------------------- | ----------------------------------------------------------------- |
-| Worker-based execution      | Move each compartment to a Worker for true availability isolation |
+| ~~Worker-based execution~~  | ✅ Implemented — see [Worker-based isolation](#worker-based-isolation) |
 | Message schema registry     | Dynamic registration of event topics and schemas at runtime       |
 | Async RPC layer             | Request/response patterns over the event bus                      |
 | Plugin lifecycle management | Load, pause, resume, and unload plugins without restarting        |

@@ -8,6 +8,10 @@ export function createLogRenderer(panelId: string) {
     if (source === "cart") return "log-cart";
     if (source === "malicious") return "log-malicious";
     if (source === "mutation") return "log-mutation";
+    // worker-prefixed sources: "worker:catalog", "worker:cart", etc.
+    if (source.startsWith("worker:catalog")) return "log-worker-catalog";
+    if (source.startsWith("worker:cart")) return "log-worker-cart";
+    if (source.startsWith("worker:")) return "log-worker";
     return "";
   }
 
