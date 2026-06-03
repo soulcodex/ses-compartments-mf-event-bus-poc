@@ -6,6 +6,9 @@ export default defineConfig({
       index: "./src/main.ts",
     },
   },
+  html: {
+    template: "./index.html",
+  },
   output: {
     distPath: {
       root: "dist",
