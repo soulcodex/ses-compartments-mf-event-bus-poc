@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "strict": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "paths": {
+      "@poc/shared": ["../../packages/shared/src/index.ts"]
+    }
+  },
+  "include": ["src", "tests"]
+}

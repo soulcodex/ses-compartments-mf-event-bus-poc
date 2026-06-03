@@ -11,6 +11,7 @@ through a host-owned event bus while preserving strict capability boundaries.
 - [What this PoC does not prove](#what-this-poc-does-not-prove)
 - [Architecture](#architecture)
 - [Worker-based isolation](#worker-based-isolation)
+- [Module Federation + SES isolation](#module-federation--ses-isolation)
 - [How it works](#how-it-works)
 - [Getting started](#getting-started)
 - [SES Compartments explained](#ses-compartments-explained)
@@ -37,6 +38,9 @@ through a host-owned event bus while preserving strict capability boundaries.
 | Variable isolation          | Globals set in one compartment invisible in another     |
 | Worker availability         | Each worker runs in its own OS thread; main thread stays responsive |
 | Worker termination          | Host can call `terminate()` to kill a rogue plugin instantly |
+| MF remote source in SES     | Rsbuild MF remote entry evaluated inside a SES Compartment  |
+| MF capability isolation     | Remote code loaded via MF cannot escape its compartment     |
+| MF event bus integration    | Compartment-loaded remotes communicate via the same host bus |
 
 ---
 
@@ -217,6 +221,180 @@ Worker "catalog"          Main Thread (host)          Worker "cart"
 | Main thread blocking      | ❌ plugin can block UI     | ✅ plugin cannot block main thread |
 | Instant plugin kill       | ❌ not possible in-thread  | ✅ worker.terminate()              |
 | Shared memory risk        | ⚠️ possible via endowments | ✅ postMessage boundary enforces it|
+
+---
+
+## Module Federation + SES isolation
+
+This is the most advanced layer in the PoC. It proves that a Micro-Frontend
+remote built with Rsbuild Module Federation can have its entry bundle fetched
+as source text and evaluated inside a SES Compartment — preserving the exact
+same capability isolation as hand-written plugins.
+
+### Workspace structure
+
+```
+ses-compartments-mf-event-bus-poc/      ← pnpm workspace root
+  packages/
+    shared/                             ← @poc/shared
+      src/
+        schemas.ts                      schemas + EventTopic
+        permissions.ts                  policies per compartment
+        errors.ts                       PermissionDeniedError, ValidationError
+        sanitize.ts                     structuredClone + harden
+        event-bus.ts                    PlatformEventBus
+        scoped-bus.ts                   makeScopedBus
+        logger.ts                       makeLogger, hostLogger, addLogSink
+
+  apps/
+    host/                               ← @poc/host  (port 3000)
+      src/platform/
+        compartment-loader.ts           ← CompartmentLoader (fetch → evaluate → extract)
+        compartment-factory.ts          in-thread factory
+        worker-bus-bridge.ts            worker bridge
+        lockdown.ts                     initializeSES()
+      tests/
+        compartment-loader.test.ts      34 exhaustive MF isolation tests
+
+    catalog/                            ← @poc/catalog  (port 3001)
+      src/plugin.ts                     MF-exposed catalog plugin
+
+    cart/                               ← @poc/cart  (port 3002)
+      src/plugin.ts                     MF-exposed cart plugin
+```
+
+### Architecture (MF + SES mode)
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  apps/host  (Main Thread)                                                │
+│                                                                          │
+│  ┌─────────────────────┐    ┌────────────────────────────────────────┐  │
+│  │  PlatformEventBus   │    │  CompartmentLoader                     │  │
+│  │  (host-owned)       │◄───│                                        │  │
+│  │                     │    │  1. fetch(remoteEntry.js) → text       │  │
+│  │  validate           │    │  2. new Compartment({ bus, logger })   │  │
+│  │  clone + harden     │    │  3. compartment.evaluate(sourceText)   │  │
+│  │  route events       │    │  4. extract container from globalThis  │  │
+│  └─────────────────────┘    │  5. container.init({})                 │  │
+│                             │  6. factory = container.get("./plugin")│  │
+│                             │  7. exports = factory()                │  │
+│                             └────────────────────────────────────────┘  │
+└──────────────────────────────┬───────────────────────────────────────────┘
+                               │  scoped bus + logger  (endowments only)
+                               │  NO process, fetch, window, document
+                ┌──────────────┴──────────────┐
+                │                             │
+                ▼                             ▼
+  ┌──────────────────────────┐  ┌──────────────────────────┐
+  │  SES Compartment         │  │  SES Compartment         │
+  │  "catalog"               │  │  "cart"                  │
+  │                          │  │                          │
+  │  source: apps/catalog    │  │  source: apps/cart       │
+  │  remoteEntry.js          │  │  remoteEntry.js          │
+  │  (fetched as text,       │  │  (fetched as text,       │
+  │   built by Rsbuild MF)   │  │   built by Rsbuild MF)   │
+  │                          │  │                          │
+  │  bus  (scoped)           │  │  bus  (scoped)           │
+  │  logger                  │  │  logger                  │
+  │  NO host globals         │  │  NO host globals         │
+  └──────────────────────────┘  └──────────────────────────┘
+       │  publishes                    │  subscribes
+       │  catalog:item-selected        │  catalog:item-selected
+       │                               │  publishes cart:item-added
+       └──────────── host bus ─────────┘
+```
+
+### MF loading flow
+
+```
+Host                         CompartmentLoader              SES Compartment
+  │                                │                               │
+  │  loadRemoteInCompartment(...)  │                               │
+  │───────────────────────────────►│                               │
+  │                                │  fetch(remoteEntry.js)        │
+  │                                │──── HTTP GET ────────────────►│
+  │                                │◄─── source text ─────────────│
+  │                                │                               │
+  │                                │  new Compartment({ bus, logger })
+  │                                │──────────────────────────────►│
+  │                                │                               │
+  │                                │  compartment.evaluate(source) │
+  │                                │──────────────────────────────►│
+  │                                │        registers container    │
+  │                                │        on compartment.globalThis
+  │                                │◄──────────────────────────────│
+  │                                │                               │
+  │                                │  container.init({})           │
+  │                                │  container.get("./plugin")    │
+  │                                │──────────────────────────────►│
+  │                                │◄── factory() → exports ───────│
+  │◄───────────────────────────────│                               │
+  │  { exports, compartment,       │                               │
+  │    cleanup() }                 │                               │
+```
+
+### Key design choice: skip MF shared scope
+
+Standard Module Federation uses a shared scope to negotiate singleton
+dependencies (React, ReactDOM, etc.) between host and remotes. This PoC
+deliberately sets `shared: []` in every app's MF config.
+
+Why: shared singletons require all compartments to access the same object
+instance, which requires passing that object through the endowments boundary
+— a non-trivial bridging problem. Remotes in this PoC are **logic-only plugins**
+with no UI framework dependency, so shared scoping is unnecessary.
+
+### Running the MF demo
+
+```bash
+# Terminal 1 — start catalog remote
+pnpm --filter @poc/catalog dev
+
+# Terminal 2 — start cart remote
+pnpm --filter @poc/cart dev
+
+# Terminal 3 — start host
+pnpm --filter @poc/host dev
+```
+
+Or use the convenience script:
+
+```bash
+# Start all three concurrently (requires concurrently or similar)
+pnpm dev:remotes &
+pnpm dev
+```
+
+Then click **📦 Run MF Demo** in the browser. The host will:
+1. Fetch `http://localhost:3001/remoteEntry.js` (catalog) as text
+2. Fetch `http://localhost:3002/remoteEntry.js` (cart) as text
+3. Evaluate each inside its own SES Compartment with a scoped bus endowment
+4. Trigger the event flow and log all communication
+
+### What MF isolation proves
+
+| Property                             | Mechanism                                             |
+|--------------------------------------|-------------------------------------------------------|
+| Bundler output is still isolatable   | Rsbuild-generated entry evaluates inside Compartment  |
+| MF container API works in compartment| `container.init()` + `container.get()` succeed        |
+| Capability isolation survives bundling| Remote cannot access `process`, `fetch`, `window`    |
+| Same bus policy applies              | Same `scoped-bus` + `permissions` used for all modes  |
+| MF globals do not leak               | Container registered on compartment globalThis, not window |
+| Payload hardening survives MF boundary| `structuredClone` + `harden` apply to MF-sourced payloads |
+
+### Test coverage (34 tests in `apps/host/tests/compartment-loader.test.ts`)
+
+| Group | What is tested |
+|---|---|
+| Container registration | Valid container extracted · missing container throws · missing `.get()` throws · custom `containerName` |
+| Plugin module loading | Factory returns exports · publish works · subscribe registers handler |
+| Capability isolation | No `process`, `fetch`, `window`, `document`, `XMLHttpRequest` · no host env leakage · cross-compartment variable isolation |
+| Bus capability enforcement | Allowed publish/subscribe · forbidden publish → PermissionDeniedError · forbidden subscribe → PermissionDeniedError · malicious remote fully blocked |
+| Payload integrity | Payload cloned · payload hardened · post-publish mutation ignored · receiver mutation throws |
+| Full integration | catalog→cart→catalog flow · cartSize accumulates · multiple sequential events |
+| Error and edge cases | Syntax error in source · factory throw caught · cleanup() removes subscriptions · empty source throws · invalid payload → Zod error |
+| MF container contract | `init()` called once · `get()` called with correct path · default modulePath · custom modulePath |
 
 ---
 
@@ -442,16 +620,20 @@ import hooks, which are more complex to configure correctly.
 
 ## Future improvements
 
-| Improvement                 | Description                                                       |
-| --------------------------- | ----------------------------------------------------------------- |
-| ~~Worker-based execution~~  | ✅ Implemented — see [Worker-based isolation](#worker-based-isolation) |
-| Message schema registry     | Dynamic registration of event topics and schemas at runtime       |
-| Async RPC layer             | Request/response patterns over the event bus                      |
-| Plugin lifecycle management | Load, pause, resume, and unload plugins without restarting        |
-| Runtime metrics             | Per-compartment publish/subscribe counters and latencies          |
-| Per-plugin quotas           | Rate-limit publish calls per compartment                          |
-| Module loading via SES      | Allow plugins to use `import` via SES import hooks                |
-| Revocable capabilities      | Allow the host to revoke bus access from a compartment at runtime |
+| Improvement                       | Description                                                             |
+| --------------------------------- | ----------------------------------------------------------------------- |
+| ~~Worker-based execution~~        | ✅ Implemented — see [Worker-based isolation](#worker-based-isolation)   |
+| ~~Module Federation + SES~~       | ✅ Implemented — see [Module Federation + SES isolation](#module-federation--ses-isolation) |
+| Zephyr Cloud deployment           | Add `zephyr-rsbuild-plugin` to remotes for versioned CDN delivery       |
+| Message schema registry           | Dynamic registration of event topics and schemas at runtime             |
+| Async RPC layer                   | Request/response patterns over the event bus                            |
+| Plugin lifecycle management       | Load, pause, resume, and unload plugins without restarting              |
+| Runtime metrics                   | Per-compartment publish/subscribe counters and latencies                |
+| Per-plugin quotas                 | Rate-limit publish calls per compartment                                |
+| Module loading via SES import hooks | Allow plugins to use `import` via SES import hooks                    |
+| Revocable capabilities            | Allow the host to revoke bus access from a compartment at runtime       |
+| UI component isolation            | Extend MF remotes to expose React/Solid components through a membrane  |
+| Cross-origin MF remotes           | CORS + CSP configuration for production cross-origin remote loading     |
 
 ---
 

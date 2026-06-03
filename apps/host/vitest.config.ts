@@ -5,4 +5,9 @@ export default defineConfig({
     environment: "node",
     globals: true,
   },
+  resolve: {
+    alias: {
+      "@poc/shared": new URL("../../packages/shared/src/index.ts", import.meta.url).pathname,
+    },
+  },
 });
