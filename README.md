@@ -14,6 +14,7 @@ through a host-owned event bus while preserving strict capability boundaries.
 - [Module Federation + SES isolation](#module-federation--ses-isolation)
 - [SES + MF compatibility notes](./docs/ses-mf-compatibility.md)
 - [Shared-variable demo — integrity vs confidentiality](#shared-variable-demo--integrity-vs-confidentiality)
+- [Counter exchange — realm attestation](#counter-exchange--realm-attestation)
 - [How it works](#how-it-works)
 - [Getting started](#getting-started)
 - [SES Compartments explained](#ses-compartments-explained)
@@ -51,6 +52,7 @@ through a host-owned event bus while preserving strict capability boundaries.
 ## What this PoC does not prove
 
 - **Confidentiality** — the bus broadcasts and gates only *writes*; any party granted read access (a legitimate subscription, or a too-broadly endowed read capability) sees every payload. Payloads are validated and frozen, not encrypted. The variable demo demonstrates this directly: a zero-permission "malicious reader" still sniffs the shared value through a leaked `getSharedValues` endowment. See [Shared-variable demo — integrity vs confidentiality](#shared-variable-demo--integrity-vs-confidentiality).
+- **Trustless attestation** — the Counter Exchange demo's attestation is the **host-anchored** variant: it trusts the host/registry to generate and stamp realm-ids unforgeably and to route directed delivery. It does *not* defend against a malicious host (which already owns the page). Directed delivery hides the value from *other realms*, but the trusted host bus still routes it in the clear; hiding it from the host too would need encryption (per-pair ECDH). Authenticity/confidentiality that survive an untrusted relay need the per-realm key-possession variant in [docs/realm-attestation.md](./docs/realm-attestation.md), which this PoC does not implement.
 - **Availability** — SES provides no CPU or memory quotas; infinite loops are still possible
 - **Host integrity** — a compromised host can do anything; a trusted host is assumed
 - **Formal verification** — this is a conceptual demonstration, not a formally verified system
@@ -484,6 +486,55 @@ cross-realm case in [docs/realm-attestation.md](./docs/realm-attestation.md)
 
 ---
 
+## Counter exchange — realm attestation
+
+The variable demo shows the bus does not gate *reads*. The **Counter Exchange**
+demo (**🤝 Run Counter Exchange**) adds the missing piece on the *write* side:
+**origin authentication** — a realm proves which origin it was served from, and a
+peer refuses to exchange the shared counter with a realm it cannot attest.
+
+The two legit realms are the **catalog and cart Module Federation remotes** (real
+origins on `:4001` / `:4002`), each fetching a certificate from a real `/attest`
+endpoint on its own origin server. A **malicious in-thread realm** sniffs a peer's
+handshake off the bus and **replays the stolen certificate**.
+
+### How identity is made unspoofable
+
+- The **host** generates each realm's id (`crypto.randomUUID`), records it in a
+  host-owned **registry**, and passes it into the realm — the realm cannot pick
+  its own id.
+- The host **stamps that id on every message** the realm publishes (`EventEnvelope.realmId`).
+- The realm sends the id to its origin's `/attest`, which returns a certificate
+  (P-256 JWS) binding `realm-id → role/origin`. **Once per realm, not per message.**
+- A receiver verifies by comparing the **host-stamped** sender id against the id
+  inside the certificate, plus the issuer signature, expiry, and registry
+  membership. A replayed (stolen) certificate fails because the thief's messages
+  are stamped with *its* id, not the certificate's → mismatch → rejected.
+
+No per-realm keypair and no per-message signatures are needed — the host stamp
+supplies per-message identity. (The stricter, host-distrusting variant using
+per-realm keys + nonces is specified in
+[docs/realm-attestation.md](./docs/realm-attestation.md).)
+
+**Reads are gated the same way.** The counter lives inside each realm and is only
+shared through messages. A realm sends `value:updated` **only to the peers it has
+attested** (directed delivery, enforced by the host bus). The malicious realm —
+attested by nobody — is in no one's recipient set, so the host never delivers it
+the value: it cannot sniff, even though it subscribes. Gating reads works on the
+*send* side, not the receive side.
+
+### Run it with and without attestation (toggle)
+
+| Mode | What happens |
+|---|---|
+| **Attestation off** | Realms broadcast every update; the malicious realm reads it (sniff) and its injected value propagates — both attacks succeed. The baseline. |
+| **Attestation on** | catalog ↔ cart attest and exchange directly; the malicious realm is starved of reads (never addressed) and its injected write is rejected (replayed cert fails the id check). Fully excluded. |
+
+This variant **trusts the host/registry** to assign and stamp ids; see *What this
+PoC does not prove*.
+
+---
+
 ## How it works
 
 ### 1. SES lockdown
@@ -564,6 +615,7 @@ Open the URL printed by Rsbuild. The following buttons are available:
 - `Run Mutation Attack` — payload mutation after publish is ignored
 - `Run Worker Demo` — same happy-path flow, each compartment in its own Worker thread
 - `Run Variable Demo` — a shared variable replicated across microfrontends: set it on one card and every replica converges; a malicious modifier is blocked, and a malicious reader sniffs without permission (see [Shared-variable demo — integrity vs confidentiality](#shared-variable-demo--integrity-vs-confidentiality))
+- `Run Counter Exchange` (+ `Require attestation` toggle) — two MF-remote realms attest via their origin and exchange the counter; a malicious realm replaying a stolen certificate is rejected when attestation is on (see [Counter exchange — realm attestation](#counter-exchange--realm-attestation))
 - `Clear Logs` — resets the log panel and the variable board
 
 **Run the MF demo (Module Federation + SES Compartments)**

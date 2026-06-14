@@ -46,6 +46,16 @@ export type CompartmentLoaderOptions = {
    * Defaults to "${name}Remote".
    */
   containerName?: string;
+  /**
+   * Host-assigned realm id. When provided it is stamped on every message the
+   * realm publishes (via the scoped bus) so verifiers read an unforgeable id.
+   */
+  realmId?: string;
+  /**
+   * Extra capability endowments (e.g. the `attest` capability, the registry
+   * `list`, an `attestationRequired` flag) injected alongside `bus`/`logger`.
+   */
+  extraEndowments?: Record<string, unknown>;
 };
 
 // ---------------------------------------------------------------------------
@@ -248,12 +258,14 @@ export async function loadRemoteInCompartment(
     exposeChunkSource,
     modulePath = "./plugin",
     containerName = `${name}Remote`,
+    realmId,
+    extraEndowments = {},
   } = options;
 
   initializeSES();
 
   const policy = policies[name];
-  const scopedBus = makeScopedBus({ compartmentName: name, policy, platformBus });
+  const scopedBus = makeScopedBus({ compartmentName: name, policy, platformBus, realmId });
   const logger = makeLogger(name);
 
   // Prepare the source for SES evaluation (sanitizeRemoteSource needs
@@ -267,6 +279,8 @@ export async function loadRemoteInCompartment(
     // Capability endowments — the only real authority granted to the remote.
     bus: scopedBus,
     logger,
+    // Attestation capability, registry view, attestationRequired flag, etc.
+    ...extraEndowments,
     // Rspack runtime stubs — no real authority, just enough for the bundle
     // bootstrap to reach the container registration line.
     ...rspackEndowments,

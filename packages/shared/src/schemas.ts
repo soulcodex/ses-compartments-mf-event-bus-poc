@@ -20,6 +20,12 @@ export const eventSchemas = {
     name: z.string(),
     value: z.number().finite(),
   }),
+
+  // Realm attestation handshake. A realm broadcasts this once with the
+  // certificate its origin issued; peers verify it before exchanging data.
+  "attest:hello": z.object({
+    cert: z.string(),
+  }),
 } as const;
 
 export type EventTopic = keyof typeof eventSchemas;

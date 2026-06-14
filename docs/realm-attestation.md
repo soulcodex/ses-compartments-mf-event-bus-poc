@@ -1,19 +1,27 @@
 # Realm Attestation — Certificate-Based Authentication Between Realms
 
-> **Status:** design proposal for this PoC. No code yet — this document specifies
-> the threat model, the protocol, and the concrete integration points before any
-> implementation.
+> **Status:** this document describes **two variants**.
+> 1. **Host-anchored (implemented in this PoC)** — the host generates each realm's
+>    id and stamps it on every message; a peer compares that stamp against an
+>    origin-signed certificate. No per-realm keys. The host/registry is trusted.
+>    This is what the **Counter Exchange** demo runs.
+> 2. **Key-possession (stricter alternative)** — each realm holds a non-extractable
+>    key and proves possession per session; works even if the relay is *not*
+>    trusted. Specified in the lower half of this document; not implemented.
 
 This extends the PoC from *capability isolation* (a realm can only do what its
-endowments allow) to *origin authentication* (a realm can prove **which remote it
-was served from**, and peers can verify that claim without trusting the relay).
+endowments allow) to *origin authentication* (a realm can prove **which origin it
+was served from**, and peers refuse to exchange data with a realm they cannot
+attest).
 
 ---
 
 ## Table of contents
 
 - [Where this fits — and where it does not](#where-this-fits--and-where-it-does-not)
+- [Implemented design (this PoC): host-anchored, keyless](#implemented-design-this-poc-host-anchored-keyless)
 - [Threat model](#threat-model)
+- **Stricter alternative — key-possession (not implemented):**
 - [Why a static certificate fails](#why-a-static-certificate-fails)
 - [The construction: ephemeral key + server-issued certificate](#the-construction-ephemeral-key--server-issued-certificate)
 - [Protocol](#protocol)
@@ -53,10 +61,110 @@ reach:
 > is for the case where there is **no** such trustworthy transport binding.
 
 In this PoC the chosen boundary is: **each realm requests a certificate from the
-web server it was served from, and verification happens realm-to-realm.** The host
-event bus is treated as an *untrusted relay* — it may drop, reorder, or duplicate
-messages, but it cannot forge a realm's signed message, and a peer can detect any
-forgery on its own.
+web server it was served from, and a peer refuses to exchange data with a realm it
+cannot attest.** The two variants below differ only in *what makes a realm-id
+unspoofable* — a trusted host stamp, or a private key.
+
+---
+
+## Implemented design (this PoC): host-anchored, keyless
+
+This is the variant the **Counter Exchange** demo runs. It trusts the host /
+registry to assign and stamp realm-ids, and uses an origin certificate purely to
+bind `realm-id → role/origin`. **No per-realm keypair, no per-message signatures.**
+
+### Trust model
+
+- **Trusted:** the host and its **registry** — it assigns each realm an id the
+  realm cannot choose, stamps that id on every message the realm publishes, and
+  exposes the live id set. (This is a *stronger* trust assumption than the
+  key-possession variant, which trusts neither the relay nor the host stamp.)
+- **Untrusted:** other realms, especially an injected malicious one.
+- **Issuer servers:** the origin each realm was served from; trusted to certify
+  the role of realms it serves.
+
+### The id is generated *out of the realm's control*
+
+The realm does **not** pick or derive its own id. The host generates it
+(`crypto.randomUUID()`), records it in the registry, and passes it into the realm
+as an endowment. The realm then submits a **sign-request over that external id** to
+its origin — once per realm, not per message. Because the host also **stamps that
+id on every message** the realm sends (the realm cannot forge the stamp), a peer
+can obtain the sender's true id from a source the sender does not control.
+
+### The seven-step flow
+
+```
+1. host generates realmId, registers it, endows it to the realm
+2. host registry.list() exposes the live realmIds (+ role/origin) to verifiers
+3. realm calls attest.requestCertificate() → host POSTs the realmId to the realm's
+   origin /attest → origin issuer signs a JWS { realmId, role, origin, iat, exp }
+4. realm wants to exchange the shared variable x with peers
+5. realm broadcasts attest:hello { cert } once
+6. a receiving realm verifies, using values the sender cannot forge:
+     envelope.realmId (host-stamped) === cert.realmId     ← compare id vs cert
+     cert signature valid against the trusted issuer anchor for cert.origin
+     cert not expired, and realmId present in the registry
+   pass → record sender in attestedPeers ; fail → ignore the sender
+7. each realm SENDS value:updated only to its attestedPeers — directed delivery,
+   enforced by the (trusted) host bus. An unattested realm is in nobody's
+   recipient set, so the host never delivers it the value: it cannot sniff.
+   (Receivers also drop any value from a sender they have not attested, which
+   defeats injection from a realm that broadcasts.)
+```
+
+### Why a stolen certificate is useless here
+
+A malicious realm can read another realm's `attest:hello` off the bus and **replay
+the certificate**. It still fails, because its own messages are stamped with *its*
+host-assigned id, not the certificate's:
+
+```
+malicious realm                 host bus                 verifier (cart realm)
+  │ replays HELLO { cert_catalog }  │  (host stamps THIS sender's id = M) │
+  │─────────────────────────────────►│───────────────────────────────────►│
+  │                                  │   envelope.realmId = M              │
+  │                                  │   cert.realmId      = catalog-id    │
+  │                                  │   M ≠ catalog-id → REJECT           │
+```
+
+So the certificate is **not a bearer token**: holding it grants nothing unless the
+host also stamps the matching id on your messages — which only the genuine realm
+gets. The origin certificate's job is narrow: bind `realm-id → role/origin`,
+signed by an issuer the verifier trusts. The host stamp supplies the per-message
+identity; no realm keypair or per-message signature is needed.
+
+### Why an unattested realm cannot read, either
+
+Confidentiality is not a separate mechanism — it falls out of *where the gate
+sits*. The value lives inside each realm and is only obtainable through messages.
+A realm sends `value:updated` **only to the peers it has attested** (directed
+delivery, enforced by the host). A realm with no valid certificate is attested by
+nobody, so it is in **nobody's recipient set** — the host never delivers it the
+value. It cannot sniff, even though it subscribes to the topic. This is the key
+correction over a broadcast bus: gating reads on the *receive* side fails (the
+subscriber just ignores the gate); gating on the *send* side works (the bytes
+never reach it).
+
+### Gating the exchange (the demo)
+
+The Counter Exchange demo runs **with and without** attestation via a toggle:
+
+- **Without:** realms replicate every `value:updated`; the malicious realm's
+  injected value propagates — the spoof succeeds. This is the baseline.
+- **With:** realms exchange only with attested peers; the malicious realm's
+  replayed certificate is rejected on id-mismatch and its value is ignored.
+
+### Integration points (as built)
+
+| Concern | Where |
+|---|---|
+| Generate + register + stamp realm-id | host `RealmRegistry` + `makeScopedBus(realmId)` stamps `EventEnvelope.realmId` |
+| Issue certificate | origin server `POST /attest` signs a P-256 JWS; public key at `/issuer.jwk` |
+| Realm-side capability | `attest` endowment: `requestCertificate()`, `verify(cert, expectedRealmId)` |
+| Trust anchors | host fetches each origin's `/issuer.jwk` once, endows them per realm |
+| Verification | the realm's own handler compares `envelope.realmId` vs `cert.realmId` |
+| Directed delivery | `bus.publish(topic, payload, recipients)` — host delivers only to subscriptions whose `realmId` ∈ recipients; realms send the value to `[self, ...attestedPeers]` |
 
 ---
 
@@ -96,6 +204,16 @@ catalog-issuer certified — and that it is fresh, not a replay — without trus
 the relay and without any prior shared secret with A.
 
 ---
+
+---
+
+# Stricter alternative — key-possession (not implemented)
+
+> Everything below specifies the **stronger** variant that does **not** trust the
+> host stamp: each realm holds a non-extractable private key and proves possession
+> per session. Use it if the relay/host is later distrusted or the design goes
+> cross-process / cross-origin where no trusted stamper exists. The PoC does not
+> build this; it is kept as the design target.
 
 ## Why a static certificate fails
 

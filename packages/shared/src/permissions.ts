@@ -8,7 +8,10 @@ export type CompartmentName =
   | "value-modifier"
   | "value-reader"
   | "malicious-value-modifier"
-  | "malicious-value-reader";
+  | "malicious-value-reader"
+  | "catalog-realm"
+  | "cart-realm"
+  | "malicious-realm";
 
 export type CompartmentPolicy = {
   canPublish: EventTopic[];
@@ -64,5 +67,29 @@ export const policies: Record<CompartmentName, CompartmentPolicy> = {
   "malicious-value-reader": {
     canPublish: [],
     canSubscribe: [],
+  },
+
+  // Attestation demo realms (loaded as MF remotes). They exchange the shared
+  // counter and broadcast their attestation handshake.
+  "catalog-realm": {
+    canPublish: ["value:updated", "attest:hello"],
+    canSubscribe: ["value:updated", "attest:hello"],
+  },
+
+  "cart-realm": {
+    canPublish: ["value:updated", "attest:hello"],
+    canSubscribe: ["value:updated", "attest:hello"],
+  },
+
+  // It is granted full bus rights on purpose — to show attestation, not bus
+  // policy, is what excludes it. It *subscribes* to value:updated, but with
+  // directed delivery no legit realm ever addresses it (it has no valid cert,
+  // so nobody attests it), so the host never delivers it the value — it cannot
+  // sniff. Its injected writes are likewise rejected: its replayed certificate
+  // fails the realm-id check. With attestation off, both attacks succeed
+  // (broadcast delivery + ungated receive) — the baseline that motivates it.
+  "malicious-realm": {
+    canPublish: ["value:updated", "attest:hello"],
+    canSubscribe: ["value:updated", "attest:hello"],
   },
 };

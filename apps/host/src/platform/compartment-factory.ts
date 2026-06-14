@@ -9,11 +9,12 @@ export function createPluginCompartment(args: {
   platformBus: PlatformEventBus;
   sourceCode: string;
   extraEndowments?: Record<string, unknown>;
+  realmId?: string;
 }) {
   initializeSES();
-  const { name, platformBus, sourceCode, extraEndowments = {} } = args;
+  const { name, platformBus, sourceCode, extraEndowments = {}, realmId } = args;
   const policy = policies[name];
-  const scopedBus = makeScopedBus({ compartmentName: name, policy, platformBus });
+  const scopedBus = makeScopedBus({ compartmentName: name, policy, platformBus, realmId });
   const logger = makeLogger(name);
   const compartment = new Compartment({ bus: scopedBus, logger, ...extraEndowments });
   compartment.evaluate(sourceCode);

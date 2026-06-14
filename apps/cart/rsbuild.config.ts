@@ -15,6 +15,7 @@ export default defineConfig({
       filename: "remoteEntry.js",
       exposes: {
         "./plugin": "./src/plugin.ts",
+        "./realm": "./src/realm.ts",
       },
       shared: [],
     }),
