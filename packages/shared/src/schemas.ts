@@ -11,6 +11,15 @@ export const eventSchemas = {
     quantity: z.number().int().positive(),
     cartSize: z.number().int().nonnegative(),
   }),
+
+  // A replicated shared variable. A value-modifier broadcasts this whenever it
+  // sets the variable; every microfrontend keeps its own local replica and
+  // updates it from these messages. It "feels like" a global variable but is
+  // physically local per compartment and kept in sync only by the bus.
+  "value:updated": z.object({
+    name: z.string(),
+    value: z.number().finite(),
+  }),
 } as const;
 
 export type EventTopic = keyof typeof eventSchemas;

@@ -1,9 +1,11 @@
 import { PlatformEventBus } from "@poc/shared";
 import { addLogSink } from "@poc/shared";
 import { createPluginCompartment } from "./platform/compartment-factory.js";
+import { initializeSES } from "./platform/lockdown.js";
 import { spawnPluginWorker } from "./platform/worker-bus-bridge.js";
 import { loadRemoteInCompartment, fetchRemoteSource } from "./platform/compartment-loader.js";
 import { createLogRenderer } from "./ui/render-log.js";
+import { createValueBoard } from "./ui/value-board.js";
 
 // ?worker tells Rsbuild to bundle plugin-worker.ts as a separate worker chunk
 // and hand back a constructor. This is the only correct way to get a Worker
@@ -15,8 +17,15 @@ import cartSource from "./plugins/cart.plugin.js?raw";
 import maliciousSource from "./plugins/malicious.plugin.js?raw";
 import mutationSource from "./plugins/mutation.plugin.js?raw";
 
+import valueModifierSource from "./plugins/value-modifier.plugin.js?raw";
+import valueReaderSource from "./plugins/value-reader.plugin.js?raw";
+import maliciousValueModifierSource from "./plugins/malicious-value-modifier.plugin.js?raw";
+import maliciousValueReaderSource from "./plugins/malicious-value-reader.plugin.js?raw";
+
 document.addEventListener("DOMContentLoaded", () => {
   const renderer = createLogRenderer("log-panel");
+  const valueBoard = createValueBoard("value-board");
+  let valueInterval: ReturnType<typeof setInterval> | null = null;
 
   addLogSink(({ source, message }) => {
     renderer.append(source, message);
@@ -161,10 +170,167 @@ document.addEventListener("DOMContentLoaded", () => {
     cartRemote.cleanup();
   }
 
+  function stopValueDemo() {
+    if (valueInterval !== null) {
+      clearInterval(valueInterval);
+      valueInterval = null;
+    }
+  }
+
+  function runValueDemo() {
+    // Re-running tears down any previous loop and clears the board.
+    stopValueDemo();
+    valueBoard.clear();
+    renderer.append("host", "--- Variable Demo (replicated shared value) ---");
+
+    // Run lockdown up front so harden() is available before we build endowments.
+    initializeSES();
+
+    const platformBus = new PlatformEventBus();
+
+    // Host-owned mirror of the shared variable, fed only from the gated bus.
+    // Used to render and to back the (deliberately leaked) read capability.
+    const board = new Map<string, number>();
+    platformBus.subscribe("value:updated", (event) => {
+      const p = event.payload as { name: string; value: number };
+      board.set(p.name, p.value);
+    });
+
+    // ⚠ DELIBERATE VULNERABILITY — the point of the malicious-reader demo.
+    // A read capability over the whole shared store. The bus enforces per-plugin
+    // policy; this endowment does NOT. Handing it to a zero-permission plugin
+    // lets it sniff the value. Correct fix: derive endowments from policy and
+    // deliver reads only through the gated bus. See README "Endowments...".
+    const getSharedValues = () => harden({ ...Object.fromEntries(board) });
+
+    type LocalApi = { getLocal(): number | null };
+
+    const modifiers = [
+      { id: "mod-a", title: "Modifier A" },
+      { id: "mod-b", title: "Modifier B" },
+    ].map((meta) => ({
+      meta,
+      compartment: createPluginCompartment({
+        name: "value-modifier",
+        platformBus,
+        sourceCode: valueModifierSource,
+      }),
+    }));
+
+    const reader = createPluginCompartment({
+      name: "value-reader",
+      platformBus,
+      sourceCode: valueReaderSource,
+    });
+
+    const malModifier = createPluginCompartment({
+      name: "malicious-value-modifier",
+      platformBus,
+      sourceCode: maliciousValueModifierSource,
+    });
+
+    const malReader = createPluginCompartment({
+      name: "malicious-value-reader",
+      platformBus,
+      sourceCode: maliciousValueReaderSource,
+      extraEndowments: { getSharedValues }, // the leak lands here
+    });
+
+    // --- Cards -------------------------------------------------------------
+    for (const { meta, compartment } of modifiers) {
+      const setValue = compartment.globalThis.setValue as (n: number) => void;
+      valueBoard.addCard({
+        id: meta.id,
+        title: meta.title,
+        role: "modifier",
+        subtitle: "value-modifier · publish + subscribe",
+        input: { initial: 0 },
+        controls: [{ label: "Set x", onClick: (v) => setValue(Number(v)) }],
+      });
+    }
+
+    valueBoard.addCard({
+      id: "reader",
+      title: "Reader",
+      role: "reader",
+      subtitle: "value-reader · subscribe only",
+    });
+    valueBoard.addCard({
+      id: "mal-mod",
+      title: "Malicious Modifier",
+      role: "malicious",
+      subtitle: "malicious-value-modifier · no rights",
+    });
+    valueBoard.addCard({
+      id: "mal-read",
+      title: "Malicious Reader",
+      role: "malicious",
+      subtitle: "malicious-value-reader · no rights",
+    });
+
+    const fmt = (v: number | null | undefined) =>
+      v === null || v === undefined ? "—" : `x = ${v}`;
+
+    // --- Render loop -------------------------------------------------------
+    function render() {
+      // Each modifier shows its OWN local replica — watch them converge on Set.
+      for (const { meta, compartment } of modifiers) {
+        const local = (compartment.globalThis as unknown as LocalApi).getLocal();
+        valueBoard.updateCard(meta.id, {
+          big: fmt(local),
+          badge: { text: "local replica", kind: "ok" },
+        });
+      }
+
+      // Legit reader — replica arrived through the gated bus.
+      const rv = (reader.globalThis as unknown as LocalApi).getLocal();
+      valueBoard.updateCard("reader", {
+        big: fmt(rv),
+        badge: { text: "subscribed", kind: "ok" },
+      });
+
+      // Malicious modifier — every write attempt was denied.
+      const attempts =
+        (malModifier.globalThis.attempts as { label: string; blocked: boolean; error?: string }[]) ??
+        [];
+      valueBoard.updateCard("mal-mod", {
+        big: "⛔",
+        badge: { text: "BLOCKED", kind: "blocked" },
+        rows: attempts.map(
+          (a) => `${a.blocked ? "⛔" : "⚠ LEAK"} ${a.label}${a.error ? ` → ${a.error}` : ""}`,
+        ),
+      });
+
+      // Malicious reader — sniffs the value via the leaked read capability.
+      const poll = malReader.globalThis.poll as (() => void) | undefined;
+      poll?.();
+      const sniffed = (malReader.globalThis.sniffed as Record<string, number>) ?? {};
+      const entries = Object.entries(sniffed);
+      valueBoard.updateCard("mal-read", {
+        big: entries.length > 0 ? `x = ${entries[0][1]}` : "—",
+        badge: { text: "⚠ SNIFFING", kind: "sniff" },
+        rows: entries.map(([k, v]) => `${k} = ${v}`),
+      });
+    }
+
+    render();
+    valueInterval = setInterval(render, 200);
+
+    renderer.append(
+      "host",
+      "variable demo running — type a number and click \"Set x\" on a modifier; every replica converges",
+    );
+  }
+
   document.getElementById("btn-happy")!.addEventListener("click", () => runHappyPath());
   document.getElementById("btn-malicious")!.addEventListener("click", () => runMalicious());
   document.getElementById("btn-mutation")!.addEventListener("click", () => runMutation());
   document.getElementById("btn-workers")!.addEventListener("click", () => runWorkerDemo());
   document.getElementById("btn-mf")!.addEventListener("click", () => runMFDemo());
-  document.getElementById("btn-clear")!.addEventListener("click", () => renderer.clear());
+  document.getElementById("btn-value")!.addEventListener("click", () => runValueDemo());
+  document.getElementById("btn-clear")!.addEventListener("click", () => {
+    stopValueDemo();
+    valueBoard.clear();
+    renderer.clear();
+  });
 });

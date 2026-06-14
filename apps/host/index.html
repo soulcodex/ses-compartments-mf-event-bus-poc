@@ -29,6 +29,55 @@
       .log-worker-cart { color: #fbbf24; }
       .log-mf-catalog { color: #34d399; }
       .log-mf-cart { color: #f59e0b; }
+      .log-value-modifier { color: #93c5fd; }
+      .log-value-reader { color: #5eead4; }
+      .log-malicious-value-modifier { color: #f87171; }
+      .log-malicious-value-reader { color: #fb7185; }
+
+      /* Shared-variable demo board */
+      #value-board {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 1rem;
+        margin: 1.5rem 0;
+      }
+      .value-card {
+        background: #1a1a1a; border: 1px solid #333; border-left-width: 4px;
+        border-radius: 6px; padding: 0.9rem 1rem;
+      }
+      .value-card.role-modifier { border-left-color: #3b82f6; }
+      .value-card.role-reader { border-left-color: #14b8a6; }
+      .value-card.role-malicious { border-left-color: #ef4444; }
+      .value-card-header {
+        display: flex; justify-content: space-between; align-items: center;
+        gap: 0.5rem; margin-bottom: 0.3rem;
+      }
+      .value-title { font-weight: bold; color: #e5e7eb; }
+      .value-subtitle { font-size: 0.7rem; color: #9ca3af; margin-bottom: 0.4rem; }
+      .value-badge {
+        font-size: 0.65rem; padding: 0.1rem 0.45rem; border-radius: 999px;
+        white-space: nowrap;
+      }
+      .badge-ok { background: #0c4a6e; color: #7dd3fc; }
+      .badge-blocked { background: #7f1d1d; color: #fca5a5; }
+      .badge-sniff { background: #831843; color: #fbcfe8; }
+      .value-big {
+        font-size: 1.6rem; font-variant-numeric: tabular-nums;
+        color: #f9fafb; margin: 0.2rem 0 0.5rem;
+      }
+      .value-rows { font-size: 0.75rem; color: #cbd5e1; min-height: 1rem; }
+      .value-row { margin: 1px 0; }
+      .value-input {
+        width: 100%; box-sizing: border-box; margin-top: 0.4rem;
+        background: #0f0f0f; color: #e5e7eb; border: 1px solid #3b82f6;
+        border-radius: 4px; padding: 0.3rem 0.5rem; font-family: monospace;
+      }
+      .value-controls {
+        display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem;
+      }
+      .value-controls button {
+        padding: 0.25rem 0.6rem; font-size: 0.7rem;
+      }
     </style>
   </head>
   <body>
@@ -39,8 +88,10 @@
       <button id="btn-mutation">⚡ Run Mutation Attack</button>
       <button id="btn-workers">🧵 Run Worker Demo</button>
       <button id="btn-mf">📦 Run MF Demo</button>
+      <button id="btn-value">🔢 Run Variable Demo</button>
       <button id="btn-clear">🗑 Clear Logs</button>
     </div>
+    <div id="value-board"></div>
     <div id="log-panel"></div>
   </body>
 </html>
