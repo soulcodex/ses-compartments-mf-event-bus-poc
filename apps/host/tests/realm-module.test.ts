@@ -35,7 +35,7 @@ function makeAttest() {
   return { attest, calls };
 }
 
-async function loadCatalogRealm(required: boolean, realmId = "rid-test") {
+async function loadCatalogRealm(mode: "observe" | "enforce", realmId = "rid-test") {
   const platformBus = new PlatformEventBus();
   const { attest, calls } = makeAttest();
   const result = await loadRemoteInCompartment({
@@ -46,35 +46,35 @@ async function loadCatalogRealm(required: boolean, realmId = "rid-test") {
     containerName: "catalogRemote",
     modulePath: "./realm",
     realmId,
-    extraEndowments: { realmId, attestationRequired: required, attest },
+    extraEndowments: { realmId, mode, attest },
   });
   return { result, calls, platformBus };
 }
 
 describe.skipIf(!bundle)("realm module — endowment threading (real MF bundle)", () => {
   it("exposes start/setValue/getStatus", async () => {
-    const { result } = await loadCatalogRealm(true);
+    const { result } = await loadCatalogRealm("enforce");
     expect(typeof result.exports.start).toBe("function");
     expect(typeof result.exports.setValue).toBe("function");
     expect(typeof result.exports.getStatus).toBe("function");
   });
 
-  it("attestationRequired=true → start() requests a certificate", async () => {
-    const { result, calls } = await loadCatalogRealm(true);
+  it("start() requests a certificate (attestation always runs)", async () => {
+    const { result, calls } = await loadCatalogRealm("enforce");
     (result.exports.start as () => void)();
     await new Promise((r) => setTimeout(r, 30));
     expect(calls.requested).toBe(1);
   });
 
-  it("attestationRequired=false → start() does nothing", async () => {
-    const { result, calls } = await loadCatalogRealm(false);
-    (result.exports.start as () => void)();
-    await new Promise((r) => setTimeout(r, 30));
-    expect(calls.requested).toBe(0);
+  it("getStatus reflects the endowed mode", async () => {
+    const enforce = await loadCatalogRealm("enforce");
+    expect((enforce.result.exports.getStatus as () => { mode: string })().mode).toBe("enforce");
+    const observe = await loadCatalogRealm("observe");
+    expect((observe.result.exports.getStatus as () => { mode: string })().mode).toBe("observe");
   });
 
   it("getStatus reflects the endowed realmId", async () => {
-    const { result } = await loadCatalogRealm(true, "rid-XYZ");
+    const { result } = await loadCatalogRealm("enforce", "rid-XYZ");
     const st = (result.exports.getStatus as () => { realmId: string })();
     expect(st.realmId).toBe("rid-XYZ");
   });

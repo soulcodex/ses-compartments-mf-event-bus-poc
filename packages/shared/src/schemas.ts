@@ -26,6 +26,10 @@ export const eventSchemas = {
   "attest:hello": z.object({
     cert: z.string(),
   }),
+
+  // A freshly (re)deployed realm asks peers for the current counter value so it
+  // can recover state after a rolling redeploy. Peers reply with value:updated.
+  "value:sync-request": z.object({}),
 } as const;
 
 export type EventTopic = keyof typeof eventSchemas;

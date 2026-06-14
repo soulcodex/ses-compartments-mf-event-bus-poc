@@ -84,52 +84,39 @@ async function main() {
   await cdp(ws, "Page.navigate", { url: "http://localhost:3000" });
   await sleep(2500);
 
-  // 4. set the checkbox and click Run Counter Exchange
-  const clickRes = await cdp(ws, "Runtime.evaluate", {
-    expression: `(() => {
-      const chk = document.getElementById('chk-attest');
-      const btn = document.getElementById('btn-attest');
-      if (!chk || !btn) return 'MISSING CONTROLS';
-      chk.checked = ${ATTEST};
-      btn.click();
-      return 'clicked, attest=' + chk.checked;
-    })()`,
-    returnByValue: true,
-  });
-  console.log("CLICK:", clickRes.result.value);
+  const evalIn = (expr) =>
+    cdp(ws, "Runtime.evaluate", { expression: expr, returnByValue: true }).then((r) => r.result.value);
+  const dumpBoard = () => evalIn(`document.getElementById('value-board')?.innerText || '(empty)'`);
+  const setCard = (id, val) =>
+    evalIn(`(() => {
+      const card = document.querySelector('[data-card-id="${id}"]');
+      if (!card) return '${id} MISSING';
+      card.querySelector('.value-input').value = '${val}';
+      card.querySelector('.value-controls button').click();
+      return 'ok';
+    })()`);
 
-  await sleep(3500); // let fetches + handshake + render happen
+  // Phase 1 — start in OBSERVE (checkbox unchecked), then Set catalog x = 42.
+  await evalIn(
+    `(() => { const c=document.getElementById('chk-attest'); c.checked=false; document.getElementById('btn-attest').click(); })()`,
+  );
+  await sleep(3500);
+  await setCard("r-catalog", 42);
+  await sleep(1200);
+  console.log("\n########## PHASE 1 — OBSERVE ##########\n" + (await dumpBoard()));
 
-  // 5. drive the exchange: catalog Set x = 42, malicious Inject x = 666
-  const actRes = await cdp(ws, "Runtime.evaluate", {
-    expression: `(() => {
-      const set = (id, val) => {
-        const card = document.querySelector('[data-card-id="' + id + '"]');
-        if (!card) return id + ' MISSING';
-        card.querySelector('.value-input').value = String(val);
-        card.querySelector('.value-controls button').click();
-        return id + ' set ' + val;
-      };
-      return [set('r-catalog', 42), set('r-mal', 666)].join(' | ');
-    })()`,
-    returnByValue: true,
-  });
-  console.log("ACTIONS:", actRes.result.value);
+  // Phase 2 — flip to ENFORCE → rolling redeploy, then malicious injects 666.
+  await evalIn(
+    `(() => { const c=document.getElementById('chk-attest'); c.checked=true; c.dispatchEvent(new Event('change')); })()`,
+  );
+  await sleep(6500); // 2 realms × ~1.7s redeploy + buffer
+  await setCard("r-mal", 666);
+  await sleep(1200);
+  console.log("\n########## PHASE 2 — ENFORCE (after rolling redeploy) ##########\n" + (await dumpBoard()));
 
-  await sleep(1500);
-
-  const dump = await cdp(ws, "Runtime.evaluate", {
-    expression: `JSON.stringify({
-      board: document.getElementById('value-board')?.innerText || '(empty)',
-      log: document.getElementById('log-panel')?.innerText || '(empty)',
-    })`,
-    returnByValue: true,
-  });
-  const { board, log } = JSON.parse(dump.result.value);
-
-  console.log("\n===== CONSOLE =====\n" + (consoleLines.join("\n") || "(none)"));
-  console.log("\n===== BOARD =====\n" + board);
-  console.log("\n===== LOG PANEL =====\n" + log);
+  console.log("\n===== LOG PANEL =====\n" + (await evalIn(`document.getElementById('log-panel')?.innerText || ''`)));
+  const errs = consoleLines.filter((l) => l.includes("exception") || l.toLowerCase().includes("error"));
+  console.log("\n===== CONSOLE (exceptions) =====\n" + (errs.join("\n") || "(none)"));
 
   ws.close();
 }

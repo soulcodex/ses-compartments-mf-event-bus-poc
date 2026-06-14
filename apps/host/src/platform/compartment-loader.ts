@@ -53,7 +53,7 @@ export type CompartmentLoaderOptions = {
   realmId?: string;
   /**
    * Extra capability endowments (e.g. the `attest` capability, the registry
-   * `list`, an `attestationRequired` flag) injected alongside `bus`/`logger`.
+   * the `mode` flag) injected alongside `bus`/`logger`.
    */
   extraEndowments?: Record<string, unknown>;
 };
@@ -279,7 +279,7 @@ export async function loadRemoteInCompartment(
     // Capability endowments — the only real authority granted to the remote.
     bus: scopedBus,
     logger,
-    // Attestation capability, registry view, attestationRequired flag, etc.
+    // Attestation capability, realm id, mode flag, etc.
     ...extraEndowments,
     // Rspack runtime stubs — no real authority, just enough for the bundle
     // bootstrap to reach the container registration line.

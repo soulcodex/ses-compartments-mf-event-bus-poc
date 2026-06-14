@@ -102,7 +102,7 @@ describe.skipIf(!built)("realm exchange — full attested handshake + directed d
         realmId,
         extraEndowments: {
           realmId,
-          attestationRequired: true,
+          mode: "enforce",
           attest: attest.makeEndowment(realmId, origin),
         },
       });

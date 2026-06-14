@@ -70,15 +70,15 @@ export const policies: Record<CompartmentName, CompartmentPolicy> = {
   },
 
   // Attestation demo realms (loaded as MF remotes). They exchange the shared
-  // counter and broadcast their attestation handshake.
+  // counter, run the attestation handshake, and re-sync state on redeploy.
   "catalog-realm": {
-    canPublish: ["value:updated", "attest:hello"],
-    canSubscribe: ["value:updated", "attest:hello"],
+    canPublish: ["value:updated", "attest:hello", "value:sync-request"],
+    canSubscribe: ["value:updated", "attest:hello", "value:sync-request"],
   },
 
   "cart-realm": {
-    canPublish: ["value:updated", "attest:hello"],
-    canSubscribe: ["value:updated", "attest:hello"],
+    canPublish: ["value:updated", "attest:hello", "value:sync-request"],
+    canSubscribe: ["value:updated", "attest:hello", "value:sync-request"],
   },
 
   // It is granted full bus rights on purpose — to show attestation, not bus

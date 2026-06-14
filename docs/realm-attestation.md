@@ -146,14 +146,25 @@ correction over a broadcast bus: gating reads on the *receive* side fails (the
 subscriber just ignores the gate); gating on the *send* side works (the bytes
 never reach it).
 
-### Gating the exchange (the demo)
+### Observe vs enforce, rolled out per microfrontend (the demo)
 
-The Counter Exchange demo runs **with and without** attestation via a toggle:
+Attestation always runs. The demo's toggle chooses the response to a certificate
+*failure*, mirroring a real staged rollout (monitor → enforce):
 
-- **Without:** realms replicate every `value:updated`; the malicious realm's
-  injected value propagates — the spoof succeeds. This is the baseline.
-- **With:** realms exchange only with attested peers; the malicious realm's
-  replayed certificate is rejected on id-mismatch and its value is ignored.
+- **Observe:** failures are logged but allowed. Realms broadcast; the malicious
+  realm sniffs and its injection is accepted — but each violation is logged.
+- **Enforce:** failures are rejected. Realms use directed delivery to attested
+  peers and drop values from unattested senders; the malicious realm is starved
+  of reads and its injection is rejected.
+
+Because microfrontends deploy independently, flipping the toggle triggers a
+**rolling redeploy** — one realm at a time: drain (`bus.unsubscribeRealm`), die,
+reload on the new mode with a fresh realm-id, re-handshake, and **re-sync the
+counter from peers** (peers push their value when they attest a freshly announced
+realm, and re-announce their own hello so the late-joining instance can attest
+them back). A half-rolled fleet still interoperates — every legit realm always
+carries a cert — so only the malicious realm's treatment changes as enforcement
+spreads. The counter value survives the rollout.
 
 ### Integration points (as built)
 

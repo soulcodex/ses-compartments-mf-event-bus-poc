@@ -523,12 +523,26 @@ attested by nobody — is in no one's recipient set, so the host never delivers 
 the value: it cannot sniff, even though it subscribes. Gating reads works on the
 *send* side, not the receive side.
 
-### Run it with and without attestation (toggle)
+### Observe vs enforce, rolled out one microfrontend at a time
 
-| Mode | What happens |
-|---|---|
-| **Attestation off** | Realms broadcast every update; the malicious realm reads it (sniff) and its injected value propagates — both attacks succeed. The baseline. |
-| **Attestation on** | catalog ↔ cart attest and exchange directly; the malicious realm is starved of reads (never addressed) and its injected write is rejected (replayed cert fails the id check). Fully excluded. |
+Attestation is **never off** — every realm always requests a certificate and
+verifies its peers. The toggle chooses what a *certificate failure* means, exactly
+like a real staged security rollout (monitor → enforce, à la CSP-Report-Only or
+Istio permissive mTLS):
+
+| Mode | On a cert failure | Malicious realm |
+|---|---|---|
+| **Observe** | logged, but allowed (broadcast continues) | sniffs and its injection is accepted — but every violation is logged |
+| **Enforce** | rejected (directed delivery to attested peers; unattested senders dropped) | starved of reads and its injection rejected — excluded |
+
+Because microfrontends deploy **independently**, flipping the toggle does **not**
+restart everything. It performs a **rolling redeploy**: one realm at a time drains
+(unsubscribes from the bus), dies, reloads on the new mode with a fresh realm-id,
+re-runs the handshake, and **re-syncs the counter from its peers** — then the next
+realm. A half-rolled fleet still interoperates (every legit realm always carries a
+cert), so the only thing that changes as enforcement rolls out is that the
+malicious realm gets progressively locked out. The counter value survives the
+whole rollout.
 
 This variant **trusts the host/registry** to assign and stamp ids; see *What this
 PoC does not prove*.

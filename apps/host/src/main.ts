@@ -330,13 +330,41 @@ document.addEventListener("DOMContentLoaded", () => {
   const CATALOG_ORIGIN = "http://localhost:4001";
   const CART_ORIGIN = "http://localhost:4002";
 
+  type AttestMode = "observe" | "enforce";
   type RealmStatus = {
     realmId: string;
     role: string;
+    mode: string;
     certStatus: string;
     attestedPeers: number;
     localValue: number | null;
+    violations: number;
   };
+  type RealmBundle = { entry: string; exposeChunk?: string };
+  type RealmHandle = {
+    cardId: string;
+    title: string;
+    subtitle: string;
+    role: "catalog-realm" | "cart-realm";
+    origin: string;
+    containerName: string;
+    bundle: RealmBundle;
+    realmId: string;
+    exports: Record<string, unknown>;
+    redeploying: boolean;
+  };
+  type AttestState = {
+    platformBus: PlatformEventBus;
+    registry: RealmRegistry;
+    attestService: ReturnType<typeof createAttestService>;
+    realms: RealmHandle[];
+    malicious: ReturnType<typeof createPluginCompartment>;
+    mode: AttestMode;
+    busy: boolean;
+  };
+  let attestState: AttestState | null = null;
+  const delay = (ms: number) => new Promise<void>((res) => window.setTimeout(res, ms));
+  const findRealm = (cardId: string) => attestState?.realms.find((r) => r.cardId === cardId);
 
   async function fetchRealmBundle(origin: string) {
     const [entry, manifest] = await Promise.all([
@@ -362,10 +390,74 @@ document.addEventListener("DOMContentLoaded", () => {
     return { entry, exposeChunk };
   }
 
-  async function runAttestedDemo(required: boolean) {
+  function loadRealmInstance(
+    state: AttestState,
+    def: { role: "catalog-realm" | "cart-realm"; origin: string; containerName: string; bundle: RealmBundle },
+    mode: AttestMode,
+  ) {
+    const realmId = state.registry.register(def.role, def.origin);
+    return loadRemoteInCompartment({
+      name: def.role,
+      platformBus: state.platformBus,
+      sourceCode: def.bundle.entry,
+      exposeChunkSource: def.bundle.exposeChunk,
+      containerName: def.containerName,
+      modulePath: "./realm",
+      realmId,
+      extraEndowments: {
+        realmId,
+        mode,
+        attest: state.attestService.makeEndowment(realmId, def.origin),
+      },
+    }).then((loaded) => ({ realmId, exports: loaded.exports }));
+  }
+
+  function renderAttest() {
+    const state = attestState;
+    if (!state) return;
+    const values: (number | null)[] = [];
+    for (const r of state.realms) {
+      const st = (r.exports.getStatus as () => RealmStatus)();
+      values.push(st.localValue);
+      valueBoard.updateCard(r.cardId, {
+        big: st.localValue === null ? "x = —" : `x = ${st.localValue}`,
+        badge: r.redeploying
+          ? { text: "🔄 redeploying…", kind: "blocked" }
+          : st.certStatus === "error"
+            ? { text: `${st.mode} · cert ✗`, kind: "blocked" }
+            : st.certStatus !== "ok"
+              ? { text: `${st.mode} · attesting…`, kind: "ok" }
+              : st.mode === "enforce"
+                ? { text: `enforce · cert ✓ · ${st.attestedPeers} peer`, kind: "ok" }
+                : { text: `observe · ${st.violations} violation(s)`, kind: st.violations > 0 ? "sniff" : "ok" },
+      });
+    }
+
+    const ms = (state.malicious.globalThis.getStatus as () => {
+      stolenCert: boolean;
+      lastInjected: number | null;
+      lastSniffed: number | null;
+    })();
+    const sniff = ms.lastSniffed === null || ms.lastSniffed === undefined ? "—" : String(ms.lastSniffed);
+    let injectRow = "inject: —";
+    let badge: { text: string; kind: "ok" | "blocked" | "sniff" } = ms.stolenCert
+      ? { text: "replayed stolen cert", kind: "sniff" }
+      : { text: "no certificate", kind: "blocked" };
+    if (ms.lastInjected !== null && ms.lastInjected !== undefined) {
+      const landed = values.includes(ms.lastInjected);
+      injectRow = landed
+        ? `inject ${ms.lastInjected} → accepted by a realm`
+        : `inject ${ms.lastInjected} → ⛔ rejected by all`;
+      badge = landed ? { text: "NOT fully excluded", kind: "sniff" } : { text: "EXCLUDED", kind: "blocked" };
+    }
+    valueBoard.updateCard("r-mal", { big: `read: ${sniff}`, badge, rows: [injectRow, `fleet mode: ${state.mode}`] });
+  }
+
+  async function runAttestedDemo(mode: AttestMode) {
     stopValueDemo();
     valueBoard.clear();
-    renderer.append("host", `--- Counter Exchange (attestation ${required ? "ON" : "OFF"}) ---`);
+    attestState = null;
+    renderer.append("host", `--- Counter Exchange (mode: ${mode.toUpperCase()}) ---`);
     initializeSES();
 
     const platformBus = new PlatformEventBus();
@@ -382,49 +474,23 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    if (required) {
-      try {
-        await Promise.all([
-          attestService.loadAnchor(CATALOG_ORIGIN),
-          attestService.loadAnchor(CART_ORIGIN),
-        ]);
-      } catch (err) {
-        renderer.append(
-          "host",
-          "⚠ could not load issuer keys from :4001/:4002 — are the origin servers serving /issuer.jwk?",
-        );
-        renderer.append("host", "  Run `pnpm demo:attest` (NOT `pnpm demo:mf` / plain `serve`).");
-        renderer.append("host", `  (${String(err)})`);
-        return;
-      }
+    // Attestation always runs — load the issuer trust anchors up front.
+    try {
+      await Promise.all([
+        attestService.loadAnchor(CATALOG_ORIGIN),
+        attestService.loadAnchor(CART_ORIGIN),
+      ]);
+    } catch (err) {
+      renderer.append("host", "⚠ could not load issuer keys from :4001/:4002 — are the origin servers serving /issuer.jwk?");
+      renderer.append("host", "  Run `pnpm demo:attest` (NOT `pnpm demo:mf` / plain `serve`).");
+      renderer.append("host", `  (${String(err)})`);
+      return;
     }
 
-    async function loadRealm(
-      role: "catalog-realm" | "cart-realm",
-      origin: string,
-      containerName: string,
-      bundle: { entry: string; exposeChunk?: string },
-    ) {
-      const realmId = registry.register(role, origin);
-      const loaded = await loadRemoteInCompartment({
-        name: role,
-        platformBus,
-        sourceCode: bundle.entry,
-        exposeChunkSource: bundle.exposeChunk,
-        containerName,
-        modulePath: "./realm",
-        realmId,
-        extraEndowments: {
-          realmId,
-          attestationRequired: required,
-          attest: attestService.makeEndowment(realmId, origin),
-        },
-      });
-      return { realmId, exports: loaded.exports };
-    }
-
-    const catalog = await loadRealm("catalog-realm", CATALOG_ORIGIN, "catalogRemote", catalogBundle);
-    const cart = await loadRealm("cart-realm", CART_ORIGIN, "cartRemote", cartBundle);
+    const defs = [
+      { cardId: "r-catalog", title: "catalog realm", subtitle: "origin :4001", role: "catalog-realm" as const, origin: CATALOG_ORIGIN, containerName: "catalogRemote", bundle: catalogBundle },
+      { cardId: "r-cart", title: "cart realm", subtitle: "origin :4002", role: "cart-realm" as const, origin: CART_ORIGIN, containerName: "cartRemote", bundle: cartBundle },
+    ];
 
     const malRealmId = registry.register("malicious", "in-thread");
     const malicious = createPluginCompartment({
@@ -435,111 +501,83 @@ document.addEventListener("DOMContentLoaded", () => {
       extraEndowments: { realmId: malRealmId },
     });
 
-    // Every realm is now loaded and subscribed — announce (no missed handshakes).
-    (catalog.exports.start as () => void)();
-    (cart.exports.start as () => void)();
-
-    // Health check: with attestation on, certs should arrive within ~1s. If not,
-    // /attest is unreachable — the usual cause of "attestation doesn't work".
-    if (required) {
-      window.setTimeout(() => {
-        const cs = (catalog.exports.getStatus as () => RealmStatus)();
-        const ts = (cart.exports.getStatus as () => RealmStatus)();
-        if (cs.certStatus !== "ok" || ts.certStatus !== "ok") {
-          renderer.append(
-            "host",
-            "⚠ attestation incomplete (no certificate) — is /attest reachable on :4001/:4002?",
-          );
-          renderer.append("host", "  Restart with `pnpm demo:attest` and hard-refresh.");
-        }
-      }, 1500);
+    const state: AttestState = { platformBus, registry, attestService, realms: [], malicious, mode, busy: false };
+    for (const def of defs) {
+      const { realmId, exports } = await loadRealmInstance(state, def, mode);
+      state.realms.push({ ...def, realmId, exports, redeploying: false });
     }
 
-    valueBoard.addCard({
-      id: "r-catalog",
-      title: "catalog realm",
-      role: "modifier",
-      subtitle: `origin :4001 · ${catalog.realmId.slice(0, 8)}`,
-      input: { initial: 0 },
-      controls: [{ label: "Set x", onClick: (v) => (catalog.exports.setValue as (n: number) => void)(Number(v)) }],
-    });
-    valueBoard.addCard({
-      id: "r-cart",
-      title: "cart realm",
-      role: "modifier",
-      subtitle: `origin :4002 · ${cart.realmId.slice(0, 8)}`,
-      input: { initial: 0 },
-      controls: [{ label: "Set x", onClick: (v) => (cart.exports.setValue as (n: number) => void)(Number(v)) }],
-    });
+    // Everyone is loaded & subscribed — announce.
+    for (const r of state.realms) (r.exports.start as () => void)();
+
+    for (const r of state.realms) {
+      valueBoard.addCard({
+        id: r.cardId,
+        title: r.title,
+        role: "modifier",
+        subtitle: r.subtitle,
+        input: { initial: 0 },
+        controls: [{
+          label: "Set x",
+          onClick: (v) => (findRealm(r.cardId)?.exports.setValue as ((n: number) => void) | undefined)?.(Number(v)),
+        }],
+      });
+    }
     valueBoard.addCard({
       id: "r-mal",
       title: "malicious realm",
       role: "malicious",
-      subtitle: `no origin · ${malRealmId.slice(0, 8)}`,
+      subtitle: "no origin",
       input: { initial: 666 },
       controls: [{ label: "Inject x", onClick: (v) => (malicious.globalThis.injectValue as (n: number) => void)(Number(v)) }],
     });
 
-    function updateRealmCard(cardId: string, st: RealmStatus) {
-      valueBoard.updateCard(cardId, {
-        big: st.localValue === null ? "x = —" : `x = ${st.localValue}`,
-        badge: !required
-          ? { text: "no attestation", kind: "ok" }
-          : st.certStatus === "ok"
-            ? { text: `cert ✓ · ${st.attestedPeers} peer`, kind: "ok" }
-            : st.certStatus === "error"
-              ? { text: "cert ✗", kind: "blocked" }
-              : { text: "attesting…", kind: "ok" },
-      });
-    }
+    attestState = state;
+    renderAttest();
+    valueInterval = setInterval(renderAttest, 300);
 
-    function render() {
-      const catalogSt = (catalog.exports.getStatus as () => RealmStatus)();
-      const cartSt = (cart.exports.getStatus as () => RealmStatus)();
-      updateRealmCard("r-catalog", catalogSt);
-      updateRealmCard("r-cart", cartSt);
-
-      const ms = (malicious.globalThis.getStatus as () => {
-        stolenCert: boolean;
-        lastInjected: number | null;
-        lastSniffed: number | null;
-      })();
-
-      // Read (sniff): with attestation on, directed delivery starves it → "—".
-      const sniff =
-        ms.lastSniffed === null || ms.lastSniffed === undefined ? "—" : String(ms.lastSniffed);
-
-      // Write (inject): did the forged value land on a legit realm?
-      let injectRow = "inject: —";
-      let badge: { text: string; kind: "ok" | "blocked" | "sniff" } = ms.stolenCert
-        ? { text: "replayed stolen cert", kind: "sniff" }
-        : { text: "no certificate", kind: "blocked" };
-      if (ms.lastInjected !== null && ms.lastInjected !== undefined) {
-        const landed =
-          catalogSt.localValue === ms.lastInjected || cartSt.localValue === ms.lastInjected;
-        injectRow = landed
-          ? `inject ${ms.lastInjected} → ✓ ACCEPTED`
-          : `inject ${ms.lastInjected} → ⛔ REJECTED`;
-        badge = landed ? { text: "ATTACK SUCCEEDED", kind: "sniff" } : { text: "EXCLUDED", kind: "blocked" };
+    window.setTimeout(() => {
+      if (!attestState) return;
+      const bad = attestState.realms.some((r) => (r.exports.getStatus as () => RealmStatus)().certStatus !== "ok");
+      if (bad) {
+        renderer.append("host", "⚠ attestation incomplete (no certificate) — is /attest reachable on :4001/:4002?");
+        renderer.append("host", "  Restart with `pnpm demo:attest` and hard-refresh.");
       }
-      valueBoard.updateCard("r-mal", {
-        big: `read: ${sniff}`,
-        badge,
-        rows: [
-          injectRow,
-          required ? "attestation on — starved of reads & writes" : "attestation off — reads & writes land",
-        ],
-      });
-    }
+    }, 1500);
 
-    render();
-    valueInterval = setInterval(render, 300);
     renderer.append(
       "host",
-      required
-        ? "attested — Set x on catalog/cart converges; malicious Inject x is rejected"
-        : "no attestation — malicious Inject x propagates to catalog & cart (the spoof)",
+      mode === "enforce"
+        ? "ENFORCE — malicious realm is rejected. Uncheck 'Enforce attestation' to roll the fleet to OBSERVE."
+        : "OBSERVE — cert failures are logged but allowed. Check 'Enforce attestation' to roll out enforcement.",
     );
+  }
+
+  async function rollingRedeploy(newMode: AttestMode) {
+    const state = attestState;
+    if (!state || state.busy || state.mode === newMode) return;
+    state.busy = true;
+    state.mode = newMode;
+    renderer.append("host", `🔄 rolling redeploy → ${newMode.toUpperCase()} (one microfrontend at a time)`);
+
+    for (const r of state.realms) {
+      r.redeploying = true;
+      renderer.append("host", `↻ ${r.title}: draining + redeploying …`);
+      state.platformBus.unsubscribeRealm(r.realmId); // it "dies": stops receiving
+      state.registry.unregister(r.realmId);
+      await delay(900);
+
+      const { realmId, exports } = await loadRealmInstance(state, r, newMode);
+      r.realmId = realmId;
+      r.exports = exports;
+      (exports.start as () => void)(); // re-handshake + re-sync from peers
+      await delay(800);
+      r.redeploying = false;
+      renderer.append("host", `✓ ${r.title} back on ${newMode.toUpperCase()} (${realmId.slice(0, 8)})`);
+    }
+
+    state.busy = false;
+    renderer.append("host", `✅ rollout complete — whole fleet on ${newMode.toUpperCase()}`);
   }
 
   document.getElementById("btn-happy")!.addEventListener("click", () => runHappyPath());
@@ -548,12 +586,18 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-workers")!.addEventListener("click", () => runWorkerDemo());
   document.getElementById("btn-mf")!.addEventListener("click", () => runMFDemo());
   document.getElementById("btn-value")!.addEventListener("click", () => runValueDemo());
+  const readMode = (): AttestMode =>
+    (document.getElementById("chk-attest") as HTMLInputElement).checked ? "enforce" : "observe";
   document.getElementById("btn-attest")!.addEventListener("click", () => {
-    const required = (document.getElementById("chk-attest") as HTMLInputElement).checked;
-    void runAttestedDemo(required);
+    void runAttestedDemo(readMode());
+  });
+  document.getElementById("chk-attest")!.addEventListener("change", () => {
+    // Toggling while the demo runs rolls the fleet over, one microfrontend at a time.
+    if (attestState && !attestState.busy) void rollingRedeploy(readMode());
   });
   document.getElementById("btn-clear")!.addEventListener("click", () => {
     stopValueDemo();
+    attestState = null;
     valueBoard.clear();
     renderer.clear();
   });

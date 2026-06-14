@@ -45,6 +45,19 @@ export class PlatformEventBus {
   }
 
   /**
+   * Remove every subscription registered by a realm — used when a realm is torn
+   * down (e.g. a rolling redeploy), so its handlers stop receiving messages.
+   */
+  unsubscribeRealm(realmId: string): void {
+    for (const [topic, subs] of this.subscribers) {
+      this.subscribers.set(
+        topic,
+        subs.filter((s) => s.realmId !== realmId),
+      );
+    }
+  }
+
+  /**
    * Publish a message. When `recipients` is provided, the host delivers ONLY to
    * subscriptions whose realmId is in that set (directed delivery) — an
    * unattested realm is in nobody's recipient set, so it never receives the
