@@ -9,6 +9,10 @@
       h1 { color: #7dd3fc; }
       .controls { display: flex; gap: 1rem; margin: 1.5rem 0; flex-wrap: wrap; align-items: center; }
       .chk-label { color: #7dd3fc; font-size: 0.85rem; display: flex; align-items: center; gap: 0.3rem; }
+      .attest-group {
+        display: inline-flex; align-items: center; gap: 0.6rem;
+        border: 1px dashed #3b82f6; border-radius: 6px; padding: 0.25rem 0.6rem;
+      }
       button {
         background: #1e3a5f; color: #7dd3fc; border: 1px solid #3b82f6;
         padding: 0.5rem 1.2rem; cursor: pointer; border-radius: 4px; font-family: monospace;
@@ -90,8 +94,12 @@
       <button id="btn-workers">🧵 Run Worker Demo</button>
       <button id="btn-mf">📦 Run MF Demo</button>
       <button id="btn-value">🔢 Run Variable Demo</button>
-      <button id="btn-attest">🤝 Run Counter Exchange</button>
-      <label class="chk-label"><input type="checkbox" id="chk-attest" checked /> Require attestation</label>
+      <span class="attest-group">
+        <button id="btn-attest">🤝 Run Counter Exchange</button>
+        <label class="chk-label" title="Applies only to Counter Exchange">
+          <input type="checkbox" id="chk-attest" checked /> Require attestation
+        </label>
+      </span>
       <button id="btn-clear">🗑 Clear Logs</button>
     </div>
     <div id="value-board"></div>

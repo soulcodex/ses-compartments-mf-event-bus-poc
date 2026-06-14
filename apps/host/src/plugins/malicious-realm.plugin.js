@@ -22,7 +22,9 @@ let lastSniffed = null;
 globalThis.stolen = false;
 
 // Try to read the counter. Directed delivery starves this when attestation is on.
+// Ignore our own injected value echoing back — we only care about peers' values.
 bus.subscribe("value:updated", (event) => {
+  if (event.realmId === realmId) return;
   lastSniffed = event.payload.value;
   logger.error(`SNIFFED x = ${lastSniffed}`);
 });
