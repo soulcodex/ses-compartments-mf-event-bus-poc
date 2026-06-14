@@ -13,6 +13,8 @@ through a host-owned event bus while preserving strict capability boundaries.
 - [Worker-based isolation](#worker-based-isolation)
 - [Module Federation + SES isolation](#module-federation--ses-isolation)
 - [SES + MF compatibility notes](./docs/ses-mf-compatibility.md)
+- [Shared-variable demo — integrity vs confidentiality](#shared-variable-demo--integrity-vs-confidentiality)
+- [Counter exchange — realm attestation](#counter-exchange--realm-attestation)
 - [How it works](#how-it-works)
 - [Getting started](#getting-started)
 - [SES Compartments explained](#ses-compartments-explained)
@@ -42,11 +44,15 @@ through a host-owned event bus while preserving strict capability boundaries.
 | MF remote source in SES     | Rsbuild MF remote entry evaluated inside a SES Compartment  |
 | MF capability isolation     | Remote code loaded via MF cannot escape its compartment     |
 | MF event bus integration    | Compartment-loaded remotes communicate via the same host bus |
+| Write integrity (variable)  | Malicious value modifier's forged `publish` denied — no fake value broadcast |
+| Read is not gated (variable)| Malicious value reader sniffs the shared value via a leaked read capability, despite zero bus rights |
 
 ---
 
 ## What this PoC does not prove
 
+- **Confidentiality** — the bus broadcasts and gates only *writes*; any party granted read access (a legitimate subscription, or a too-broadly endowed read capability) sees every payload. Payloads are validated and frozen, not encrypted. The variable demo demonstrates this directly: a zero-permission "malicious reader" still sniffs the shared value through a leaked `getSharedValues` endowment. See [Shared-variable demo — integrity vs confidentiality](#shared-variable-demo--integrity-vs-confidentiality).
+- **Trustless attestation** — the Counter Exchange demo's attestation is the **host-anchored** variant: it trusts the host/registry to generate and stamp realm-ids unforgeably and to route directed delivery. It does *not* defend against a malicious host (which already owns the page). Directed delivery hides the value from *other realms*, but the trusted host bus still routes it in the clear; hiding it from the host too would need encryption (per-pair ECDH). Authenticity/confidentiality that survive an untrusted relay need the per-realm key-possession variant in [docs/realm-attestation.md](./docs/realm-attestation.md), which this PoC does not implement.
 - **Availability** — SES provides no CPU or memory quotas; infinite loops are still possible
 - **Host integrity** — a compromised host can do anything; a trusted host is assumed
 - **Formal verification** — this is a conceptual demonstration, not a formally verified system
@@ -425,6 +431,124 @@ Then open `http://localhost:3000` and click **📦 Run MF Demo**. The host will:
 
 ---
 
+## Shared-variable demo — integrity vs confidentiality
+
+The variable demo (**🔢 Run Variable Demo**) is the graphic scenario. It renders a
+live board of microfrontends that share one variable `x`. The variable *feels*
+global, but it is physically a **local replica inside each compartment**, kept in
+sync only by bus messages — set it on one card and watch every replica converge.
+The demo makes one point: **the bus gates writes, but it cannot gate reads.**
+Integrity is protected; confidentiality is not.
+
+Each microfrontend holds its own `x`. A modifier never mutates its replica
+directly — it broadcasts `value:updated`, and *every* replica (including the
+sender's own) is updated only when that message arrives. Writes and reads of the
+"global" travel the exact same path: the bus.
+
+### The four roles
+
+| Plugin | Policy | Behaviour |
+|---|---|---|
+| **value modifier** (×2) | publish + subscribe `value:updated` | Has a number input + **Set x** button; setting broadcasts the new value, replicated onto every card. |
+| **value reader** | subscribe `value:updated` only | Replicates and displays the value read-only; its own publish attempt is denied. |
+| **malicious value modifier** | nothing | Tries to forge and broadcast a fake value → every `publish` is denied with `PermissionDeniedError`. **Blocked.** |
+| **malicious value reader** | nothing | Has no bus rights at all, yet **successfully sniffs the value**. |
+
+### Why the malicious modifier is blocked but the malicious reader is not
+
+The bus is the **only write path**, and `makeScopedBus` checks `canPublish`
+before anything is published. The malicious modifier has no publish rights, so it
+can never push a value other replicas would accept — **integrity holds**.
+
+The malicious reader succeeds through a **deliberately planted vulnerability**: a
+`getSharedValues()` read capability that the host endows into the demo
+compartments. The bus enforces per-plugin policy; an **endowment does not**. A
+read capability *is* authority (see [Endowments as capabilities](#endowments-as-capabilities)),
+and handing it to a zero-permission plugin lets it read the value — even though
+the bus correctly denies it a subscription. The snapshot it gets is frozen, so it
+gains no *write* power; only confidentiality is lost, not integrity.
+
+```
+malicious modifier            host bus              malicious reader
+   │ publish(value:updated)      │                        │ getSharedValues()
+   │────────────X (denied)       │                        │──────────────┐
+   │  PermissionDeniedError      │                        │   reads the  │
+   │                             │   store (frozen)  ◄─────┘   shared store│
+   │  integrity preserved        │                        │   confidentiality lost
+```
+
+**The fix** (what a real system should do): derive endowments from policy — never
+give `getSharedValues` to a plugin whose policy has no subscribe rights — and
+deliver reads **only** through the gated bus, so visibility follows the same
+policy as publishing. The same confidentiality gap is discussed for the
+cross-realm case in [docs/realm-attestation.md](./docs/realm-attestation.md)
+(payloads are validated, not encrypted; any reader sees them).
+
+---
+
+## Counter exchange — realm attestation
+
+The variable demo shows the bus does not gate *reads*. The **Counter Exchange**
+demo (**🤝 Run Counter Exchange**) adds the missing piece on the *write* side:
+**origin authentication** — a realm proves which origin it was served from, and a
+peer refuses to exchange the shared counter with a realm it cannot attest.
+
+The two legit realms are the **catalog and cart Module Federation remotes** (real
+origins on `:4001` / `:4002`), each fetching a certificate from a real `/attest`
+endpoint on its own origin server. A **malicious in-thread realm** sniffs a peer's
+handshake off the bus and **replays the stolen certificate**.
+
+### How identity is made unspoofable
+
+- The **host** generates each realm's id (`crypto.randomUUID`), records it in a
+  host-owned **registry**, and passes it into the realm — the realm cannot pick
+  its own id.
+- The host **stamps that id on every message** the realm publishes (`EventEnvelope.realmId`).
+- The realm sends the id to its origin's `/attest`, which returns a certificate
+  (P-256 JWS) binding `realm-id → role/origin`. **Once per realm, not per message.**
+- A receiver verifies by comparing the **host-stamped** sender id against the id
+  inside the certificate, plus the issuer signature, expiry, and registry
+  membership. A replayed (stolen) certificate fails because the thief's messages
+  are stamped with *its* id, not the certificate's → mismatch → rejected.
+
+No per-realm keypair and no per-message signatures are needed — the host stamp
+supplies per-message identity. (The stricter, host-distrusting variant using
+per-realm keys + nonces is specified in
+[docs/realm-attestation.md](./docs/realm-attestation.md).)
+
+**Reads are gated the same way.** The counter lives inside each realm and is only
+shared through messages. A realm sends `value:updated` **only to the peers it has
+attested** (directed delivery, enforced by the host bus). The malicious realm —
+attested by nobody — is in no one's recipient set, so the host never delivers it
+the value: it cannot sniff, even though it subscribes. Gating reads works on the
+*send* side, not the receive side.
+
+### Observe vs enforce, rolled out one microfrontend at a time
+
+Attestation is **never off** — every realm always requests a certificate and
+verifies its peers. The toggle chooses what a *certificate failure* means, exactly
+like a real staged security rollout (monitor → enforce, à la CSP-Report-Only or
+Istio permissive mTLS):
+
+| Mode | On a cert failure | Malicious realm |
+|---|---|---|
+| **Observe** | logged, but allowed (broadcast continues) | sniffs and its injection is accepted — but every violation is logged |
+| **Enforce** | rejected (directed delivery to attested peers; unattested senders dropped) | starved of reads and its injection rejected — excluded |
+
+Because microfrontends deploy **independently**, flipping the toggle does **not**
+restart everything. It performs a **rolling redeploy**: one realm at a time drains
+(unsubscribes from the bus), dies, reloads on the new mode with a fresh realm-id,
+re-runs the handshake, and **re-syncs the counter from its peers** — then the next
+realm. A half-rolled fleet still interoperates (every legit realm always carries a
+cert), so the only thing that changes as enforcement rolls out is that the
+malicious realm gets progressively locked out. The counter value survives the
+whole rollout.
+
+This variant **trusts the host/registry** to assign and stamp ids; see *What this
+PoC does not prove*.
+
+---
+
 ## How it works
 
 ### 1. SES lockdown
@@ -498,13 +622,15 @@ pnpm demo:node
 pnpm dev
 ```
 
-Open the URL printed by Rsbuild. Five buttons are available:
+Open the URL printed by Rsbuild. The following buttons are available:
 
 - `Run Happy Path` — catalog → cart → catalog full flow (in-thread)
 - `Run Malicious Plugin` — blocked publish and subscribe attempts
 - `Run Mutation Attack` — payload mutation after publish is ignored
 - `Run Worker Demo` — same happy-path flow, each compartment in its own Worker thread
-- `Clear Logs` — resets the log panel
+- `Run Variable Demo` — a shared variable replicated across microfrontends: set it on one card and every replica converges; a malicious modifier is blocked, and a malicious reader sniffs without permission (see [Shared-variable demo — integrity vs confidentiality](#shared-variable-demo--integrity-vs-confidentiality))
+- `Run Counter Exchange` (+ `Require attestation` toggle) — two MF-remote realms attest via their origin and exchange the counter; a malicious realm replaying a stolen certificate is rejected when attestation is on (see [Counter exchange — realm attestation](#counter-exchange--realm-attestation))
+- `Clear Logs` — resets the log panel and the variable board
 
 **Run the MF demo (Module Federation + SES Compartments)**
 
@@ -579,6 +705,15 @@ This PoC endows only two things per compartment:
 
 Nothing else is accessible inside the compartment.
 
+**A read capability is still authority.** The [variable demo](#shared-variable-demo--integrity-vs-confidentiality)
+deliberately breaks this discipline to show the consequence: it endows a third
+capability, `getSharedValues()`, which returns a snapshot of the shared store.
+Because it is endowed uniformly — ignoring each plugin's bus policy — a plugin
+with *no* subscribe rights can call it and read everything. The bus never sees
+this access, so its permission checks are irrelevant. The lesson: scope every
+endowment to the plugin's policy; a function that reveals data is as much a
+granted authority as one that performs an action.
+
 ---
 
 ## Why the bus must be host-owned
@@ -628,6 +763,14 @@ bus.subscribe("catalog:item-selected", (event) => {
 ```
 
 `structuredClone` + `harden` together eliminate both attack vectors.
+
+But hardening only protects *integrity*. A shared object — or a shared read
+capability over host state — still leaks *confidentiality*, because freezing data
+does not stop anyone holding the reference from reading it. The variable demo's
+`getSharedValues()` leak is exactly this: the snapshot it hands out is frozen (so
+the sniffer cannot tamper with it), yet handing it out at all lets an unauthorized
+plugin read the value. Freeze what you share — but more importantly, only share it
+with plugins whose policy already permits the read.
 
 ---
 

@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "rsbuild dev --port 3001",
     "build": "rsbuild build",
-    "serve": "serve dist -p 4001 -C --no-port-switching"
+    "serve": "node ../../scripts/origin-server.mjs --dist dist --port 4001 --role catalog --origin http://localhost:4001"
   },
   "dependencies": {
     "@poc/shared": "workspace:*",

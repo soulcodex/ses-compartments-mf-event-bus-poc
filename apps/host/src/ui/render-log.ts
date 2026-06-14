@@ -13,6 +13,10 @@ export function createLogRenderer(panelId: string) {
     if (source.startsWith("worker:")) return "log-worker";
     if (source.startsWith("mf:catalog")) return "log-mf-catalog";
     if (source.startsWith("mf:cart")) return "log-mf-cart";
+    if (source === "malicious-value-modifier") return "log-malicious-value-modifier";
+    if (source === "malicious-value-reader") return "log-malicious-value-reader";
+    if (source === "value-modifier") return "log-value-modifier";
+    if (source === "value-reader") return "log-value-reader";
     return "";
   }
 

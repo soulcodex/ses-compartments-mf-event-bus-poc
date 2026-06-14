@@ -9,7 +9,8 @@
     "test": "pnpm -r run test && pnpm exec vitest run",
     "demo:node": "pnpm --filter @poc/host demo:node",
     "dev:remotes": "concurrently \"pnpm --filter @poc/catalog dev\" \"pnpm --filter @poc/cart dev\"",
-    "demo:mf": "pnpm build:remotes && concurrently \"pnpm --filter @poc/catalog serve\" \"pnpm --filter @poc/cart serve\" \"pnpm --filter @poc/host dev\""
+    "demo:mf": "pnpm build:remotes && concurrently \"pnpm --filter @poc/catalog serve\" \"pnpm --filter @poc/cart serve\" \"pnpm --filter @poc/host dev\"",
+    "demo:attest": "pnpm build:remotes && concurrently \"pnpm --filter @poc/catalog serve\" \"pnpm --filter @poc/cart serve\" \"pnpm --filter @poc/host dev\""
   },
   "devDependencies": {
     "concurrently": "^10.0.3",

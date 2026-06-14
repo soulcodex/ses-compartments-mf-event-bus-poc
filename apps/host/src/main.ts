@@ -1,9 +1,11 @@
 import { PlatformEventBus } from "@poc/shared";
 import { addLogSink } from "@poc/shared";
 import { createPluginCompartment } from "./platform/compartment-factory.js";
+import { initializeSES } from "./platform/lockdown.js";
 import { spawnPluginWorker } from "./platform/worker-bus-bridge.js";
 import { loadRemoteInCompartment, fetchRemoteSource } from "./platform/compartment-loader.js";
 import { createLogRenderer } from "./ui/render-log.js";
+import { createValueBoard } from "./ui/value-board.js";
 
 // ?worker tells Rsbuild to bundle plugin-worker.ts as a separate worker chunk
 // and hand back a constructor. This is the only correct way to get a Worker
@@ -15,8 +17,19 @@ import cartSource from "./plugins/cart.plugin.js?raw";
 import maliciousSource from "./plugins/malicious.plugin.js?raw";
 import mutationSource from "./plugins/mutation.plugin.js?raw";
 
+import valueModifierSource from "./plugins/value-modifier.plugin.js?raw";
+import valueReaderSource from "./plugins/value-reader.plugin.js?raw";
+import maliciousValueModifierSource from "./plugins/malicious-value-modifier.plugin.js?raw";
+import maliciousValueReaderSource from "./plugins/malicious-value-reader.plugin.js?raw";
+import maliciousRealmSource from "./plugins/malicious-realm.plugin.js?raw";
+
+import { RealmRegistry } from "./platform/realm-registry.js";
+import { createAttestService } from "./platform/attest.js";
+
 document.addEventListener("DOMContentLoaded", () => {
   const renderer = createLogRenderer("log-panel");
+  const valueBoard = createValueBoard("value-board");
+  let valueInterval: ReturnType<typeof setInterval> | null = null;
 
   addLogSink(({ source, message }) => {
     renderer.append(source, message);
@@ -161,10 +174,431 @@ document.addEventListener("DOMContentLoaded", () => {
     cartRemote.cleanup();
   }
 
+  function stopValueDemo() {
+    if (valueInterval !== null) {
+      clearInterval(valueInterval);
+      valueInterval = null;
+    }
+  }
+
+  function runValueDemo() {
+    // Re-running tears down any previous loop and clears the board.
+    stopValueDemo();
+    valueBoard.clear();
+    renderer.append("host", "--- Variable Demo (replicated shared value) ---");
+
+    // Run lockdown up front so harden() is available before we build endowments.
+    initializeSES();
+
+    const platformBus = new PlatformEventBus();
+
+    // Host-owned mirror of the shared variable, fed only from the gated bus.
+    // Used to render and to back the (deliberately leaked) read capability.
+    const board = new Map<string, number>();
+    platformBus.subscribe("value:updated", (event) => {
+      const p = event.payload as { name: string; value: number };
+      board.set(p.name, p.value);
+    });
+
+    // ⚠ DELIBERATE VULNERABILITY — the point of the malicious-reader demo.
+    // A read capability over the whole shared store. The bus enforces per-plugin
+    // policy; this endowment does NOT. Handing it to a zero-permission plugin
+    // lets it sniff the value. Correct fix: derive endowments from policy and
+    // deliver reads only through the gated bus. See README "Endowments...".
+    const getSharedValues = () => harden({ ...Object.fromEntries(board) });
+
+    type LocalApi = { getLocal(): number | null };
+
+    const modifiers = [
+      { id: "mod-a", title: "Modifier A" },
+      { id: "mod-b", title: "Modifier B" },
+    ].map((meta) => ({
+      meta,
+      compartment: createPluginCompartment({
+        name: "value-modifier",
+        platformBus,
+        sourceCode: valueModifierSource,
+      }),
+    }));
+
+    const reader = createPluginCompartment({
+      name: "value-reader",
+      platformBus,
+      sourceCode: valueReaderSource,
+    });
+
+    const malModifier = createPluginCompartment({
+      name: "malicious-value-modifier",
+      platformBus,
+      sourceCode: maliciousValueModifierSource,
+    });
+
+    const malReader = createPluginCompartment({
+      name: "malicious-value-reader",
+      platformBus,
+      sourceCode: maliciousValueReaderSource,
+      extraEndowments: { getSharedValues }, // the leak lands here
+    });
+
+    // --- Cards -------------------------------------------------------------
+    for (const { meta, compartment } of modifiers) {
+      const setValue = compartment.globalThis.setValue as (n: number) => void;
+      valueBoard.addCard({
+        id: meta.id,
+        title: meta.title,
+        role: "modifier",
+        subtitle: "value-modifier · publish + subscribe",
+        input: { initial: 0 },
+        controls: [{ label: "Set x", onClick: (v) => setValue(Number(v)) }],
+      });
+    }
+
+    valueBoard.addCard({
+      id: "reader",
+      title: "Reader",
+      role: "reader",
+      subtitle: "value-reader · subscribe only",
+    });
+    valueBoard.addCard({
+      id: "mal-mod",
+      title: "Malicious Modifier",
+      role: "malicious",
+      subtitle: "malicious-value-modifier · no rights",
+    });
+    valueBoard.addCard({
+      id: "mal-read",
+      title: "Malicious Reader",
+      role: "malicious",
+      subtitle: "malicious-value-reader · no rights",
+    });
+
+    const fmt = (v: number | null | undefined) =>
+      v === null || v === undefined ? "—" : `x = ${v}`;
+
+    // --- Render loop -------------------------------------------------------
+    function render() {
+      // Each modifier shows its OWN local replica — watch them converge on Set.
+      for (const { meta, compartment } of modifiers) {
+        const local = (compartment.globalThis as unknown as LocalApi).getLocal();
+        valueBoard.updateCard(meta.id, {
+          big: fmt(local),
+          badge: { text: "local replica", kind: "ok" },
+        });
+      }
+
+      // Legit reader — replica arrived through the gated bus.
+      const rv = (reader.globalThis as unknown as LocalApi).getLocal();
+      valueBoard.updateCard("reader", {
+        big: fmt(rv),
+        badge: { text: "subscribed", kind: "ok" },
+      });
+
+      // Malicious modifier — every write attempt was denied.
+      const attempts =
+        (malModifier.globalThis.attempts as { label: string; blocked: boolean; error?: string }[]) ??
+        [];
+      valueBoard.updateCard("mal-mod", {
+        big: "⛔",
+        badge: { text: "BLOCKED", kind: "blocked" },
+        rows: attempts.map(
+          (a) => `${a.blocked ? "⛔" : "⚠ LEAK"} ${a.label}${a.error ? ` → ${a.error}` : ""}`,
+        ),
+      });
+
+      // Malicious reader — sniffs the value via the leaked read capability.
+      const poll = malReader.globalThis.poll as (() => void) | undefined;
+      poll?.();
+      const sniffed = (malReader.globalThis.sniffed as Record<string, number>) ?? {};
+      const entries = Object.entries(sniffed);
+      valueBoard.updateCard("mal-read", {
+        big: entries.length > 0 ? `x = ${entries[0][1]}` : "—",
+        badge: { text: "⚠ SNIFFING", kind: "sniff" },
+        rows: entries.map(([k, v]) => `${k} = ${v}`),
+      });
+    }
+
+    render();
+    valueInterval = setInterval(render, 200);
+
+    renderer.append(
+      "host",
+      "variable demo running — type a number and click \"Set x\" on a modifier; every replica converges",
+    );
+  }
+
+  // ----- Counter Exchange (realm attestation) ----------------------------
+  const CATALOG_ORIGIN = "http://localhost:4001";
+  const CART_ORIGIN = "http://localhost:4002";
+
+  type AttestMode = "observe" | "enforce";
+  type RealmStatus = {
+    realmId: string;
+    role: string;
+    mode: string;
+    certStatus: string;
+    attestedPeers: number;
+    localValue: number | null;
+    violations: number;
+  };
+  type RealmBundle = { entry: string; exposeChunk?: string };
+  type RealmHandle = {
+    cardId: string;
+    title: string;
+    subtitle: string;
+    role: "catalog-realm" | "cart-realm";
+    origin: string;
+    containerName: string;
+    bundle: RealmBundle;
+    realmId: string;
+    exports: Record<string, unknown>;
+    redeploying: boolean;
+  };
+  type AttestState = {
+    platformBus: PlatformEventBus;
+    registry: RealmRegistry;
+    attestService: ReturnType<typeof createAttestService>;
+    realms: RealmHandle[];
+    malicious: ReturnType<typeof createPluginCompartment>;
+    mode: AttestMode;
+    busy: boolean;
+  };
+  let attestState: AttestState | null = null;
+  const delay = (ms: number) => new Promise<void>((res) => window.setTimeout(res, ms));
+  const findRealm = (cardId: string) => attestState?.realms.find((r) => r.cardId === cardId);
+
+  async function fetchRealmBundle(origin: string) {
+    const [entry, manifest] = await Promise.all([
+      fetchRemoteSource(`${origin}/remoteEntry.js`).catch(() => null),
+      fetchRemoteSource(`${origin}/mf-manifest.json`).catch(() => null),
+    ]);
+    if (!entry) return null;
+    let exposeChunk: string | undefined;
+    if (manifest) {
+      try {
+        const m = JSON.parse(manifest) as {
+          exposes?: { path: string; assets?: { js?: { sync?: string[]; async?: string[] } } }[];
+        };
+        const realmExpose = (m.exposes ?? []).find((e) => e.path === "./realm");
+        const chunkPath = realmExpose?.assets?.js?.sync?.[0] ?? realmExpose?.assets?.js?.async?.[0];
+        if (chunkPath) {
+          exposeChunk = await fetchRemoteSource(`${origin}/${chunkPath}`).catch(() => undefined);
+        }
+      } catch {
+        /* ignore — chunk is optional */
+      }
+    }
+    return { entry, exposeChunk };
+  }
+
+  function loadRealmInstance(
+    state: AttestState,
+    def: { role: "catalog-realm" | "cart-realm"; origin: string; containerName: string; bundle: RealmBundle },
+    mode: AttestMode,
+  ) {
+    const realmId = state.registry.register(def.role, def.origin);
+    return loadRemoteInCompartment({
+      name: def.role,
+      platformBus: state.platformBus,
+      sourceCode: def.bundle.entry,
+      exposeChunkSource: def.bundle.exposeChunk,
+      containerName: def.containerName,
+      modulePath: "./realm",
+      realmId,
+      extraEndowments: {
+        realmId,
+        mode,
+        attest: state.attestService.makeEndowment(realmId, def.origin),
+      },
+    }).then((loaded) => ({ realmId, exports: loaded.exports }));
+  }
+
+  function renderAttest() {
+    const state = attestState;
+    if (!state) return;
+    const values: (number | null)[] = [];
+    for (const r of state.realms) {
+      const st = (r.exports.getStatus as () => RealmStatus)();
+      values.push(st.localValue);
+      valueBoard.updateCard(r.cardId, {
+        big: st.localValue === null ? "x = —" : `x = ${st.localValue}`,
+        badge: r.redeploying
+          ? { text: "🔄 redeploying…", kind: "blocked" }
+          : st.certStatus === "error"
+            ? { text: `${st.mode} · cert ✗`, kind: "blocked" }
+            : st.certStatus !== "ok"
+              ? { text: `${st.mode} · attesting…`, kind: "ok" }
+              : st.mode === "enforce"
+                ? { text: `enforce · cert ✓ · ${st.attestedPeers} peer`, kind: "ok" }
+                : { text: `observe · ${st.violations} violation(s)`, kind: st.violations > 0 ? "sniff" : "ok" },
+      });
+    }
+
+    const ms = (state.malicious.globalThis.getStatus as () => {
+      stolenCert: boolean;
+      lastInjected: number | null;
+      lastSniffed: number | null;
+    })();
+    const sniff = ms.lastSniffed === null || ms.lastSniffed === undefined ? "—" : String(ms.lastSniffed);
+    let injectRow = "inject: —";
+    let badge: { text: string; kind: "ok" | "blocked" | "sniff" } = ms.stolenCert
+      ? { text: "replayed stolen cert", kind: "sniff" }
+      : { text: "no certificate", kind: "blocked" };
+    if (ms.lastInjected !== null && ms.lastInjected !== undefined) {
+      const landed = values.includes(ms.lastInjected);
+      injectRow = landed
+        ? `inject ${ms.lastInjected} → accepted by a realm`
+        : `inject ${ms.lastInjected} → ⛔ rejected by all`;
+      badge = landed ? { text: "NOT fully excluded", kind: "sniff" } : { text: "EXCLUDED", kind: "blocked" };
+    }
+    valueBoard.updateCard("r-mal", { big: `read: ${sniff}`, badge, rows: [injectRow, `fleet mode: ${state.mode}`] });
+  }
+
+  async function runAttestedDemo(mode: AttestMode) {
+    stopValueDemo();
+    valueBoard.clear();
+    attestState = null;
+    renderer.append("host", `--- Counter Exchange (mode: ${mode.toUpperCase()}) ---`);
+    initializeSES();
+
+    const platformBus = new PlatformEventBus();
+    const registry = new RealmRegistry();
+    const attestService = createAttestService({ registry });
+
+    renderer.append("host", "fetching realm remotes from :4001 and :4002 ...");
+    const [catalogBundle, cartBundle] = await Promise.all([
+      fetchRealmBundle(CATALOG_ORIGIN),
+      fetchRealmBundle(CART_ORIGIN),
+    ]);
+    if (!catalogBundle || !cartBundle) {
+      renderer.append("host", "⚠ realm remotes not found — run `pnpm demo:attest` first");
+      return;
+    }
+
+    // Attestation always runs — load the issuer trust anchors up front.
+    try {
+      await Promise.all([
+        attestService.loadAnchor(CATALOG_ORIGIN),
+        attestService.loadAnchor(CART_ORIGIN),
+      ]);
+    } catch (err) {
+      renderer.append("host", "⚠ could not load issuer keys from :4001/:4002 — are the origin servers serving /issuer.jwk?");
+      renderer.append("host", "  Run `pnpm demo:attest` (NOT `pnpm demo:mf` / plain `serve`).");
+      renderer.append("host", `  (${String(err)})`);
+      return;
+    }
+
+    const defs = [
+      { cardId: "r-catalog", title: "catalog realm", subtitle: "origin :4001", role: "catalog-realm" as const, origin: CATALOG_ORIGIN, containerName: "catalogRemote", bundle: catalogBundle },
+      { cardId: "r-cart", title: "cart realm", subtitle: "origin :4002", role: "cart-realm" as const, origin: CART_ORIGIN, containerName: "cartRemote", bundle: cartBundle },
+    ];
+
+    const malRealmId = registry.register("malicious", "in-thread");
+    const malicious = createPluginCompartment({
+      name: "malicious-realm",
+      platformBus,
+      sourceCode: maliciousRealmSource,
+      realmId: malRealmId,
+      extraEndowments: { realmId: malRealmId },
+    });
+
+    const state: AttestState = { platformBus, registry, attestService, realms: [], malicious, mode, busy: false };
+    for (const def of defs) {
+      const { realmId, exports } = await loadRealmInstance(state, def, mode);
+      state.realms.push({ ...def, realmId, exports, redeploying: false });
+    }
+
+    // Everyone is loaded & subscribed — announce.
+    for (const r of state.realms) (r.exports.start as () => void)();
+
+    for (const r of state.realms) {
+      valueBoard.addCard({
+        id: r.cardId,
+        title: r.title,
+        role: "modifier",
+        subtitle: r.subtitle,
+        input: { initial: 0 },
+        controls: [{
+          label: "Set x",
+          onClick: (v) => (findRealm(r.cardId)?.exports.setValue as ((n: number) => void) | undefined)?.(Number(v)),
+        }],
+      });
+    }
+    valueBoard.addCard({
+      id: "r-mal",
+      title: "malicious realm",
+      role: "malicious",
+      subtitle: "no origin",
+      input: { initial: 666 },
+      controls: [{ label: "Inject x", onClick: (v) => (malicious.globalThis.injectValue as (n: number) => void)(Number(v)) }],
+    });
+
+    attestState = state;
+    renderAttest();
+    valueInterval = setInterval(renderAttest, 300);
+
+    window.setTimeout(() => {
+      if (!attestState) return;
+      const bad = attestState.realms.some((r) => (r.exports.getStatus as () => RealmStatus)().certStatus !== "ok");
+      if (bad) {
+        renderer.append("host", "⚠ attestation incomplete (no certificate) — is /attest reachable on :4001/:4002?");
+        renderer.append("host", "  Restart with `pnpm demo:attest` and hard-refresh.");
+      }
+    }, 1500);
+
+    renderer.append(
+      "host",
+      mode === "enforce"
+        ? "ENFORCE — malicious realm is rejected. Uncheck 'Enforce attestation' to roll the fleet to OBSERVE."
+        : "OBSERVE — cert failures are logged but allowed. Check 'Enforce attestation' to roll out enforcement.",
+    );
+  }
+
+  async function rollingRedeploy(newMode: AttestMode) {
+    const state = attestState;
+    if (!state || state.busy || state.mode === newMode) return;
+    state.busy = true;
+    state.mode = newMode;
+    renderer.append("host", `🔄 rolling redeploy → ${newMode.toUpperCase()} (one microfrontend at a time)`);
+
+    for (const r of state.realms) {
+      r.redeploying = true;
+      renderer.append("host", `↻ ${r.title}: draining + redeploying …`);
+      state.platformBus.unsubscribeRealm(r.realmId); // it "dies": stops receiving
+      state.registry.unregister(r.realmId);
+      await delay(900);
+
+      const { realmId, exports } = await loadRealmInstance(state, r, newMode);
+      r.realmId = realmId;
+      r.exports = exports;
+      (exports.start as () => void)(); // re-handshake + re-sync from peers
+      await delay(800);
+      r.redeploying = false;
+      renderer.append("host", `✓ ${r.title} back on ${newMode.toUpperCase()} (${realmId.slice(0, 8)})`);
+    }
+
+    state.busy = false;
+    renderer.append("host", `✅ rollout complete — whole fleet on ${newMode.toUpperCase()}`);
+  }
+
   document.getElementById("btn-happy")!.addEventListener("click", () => runHappyPath());
   document.getElementById("btn-malicious")!.addEventListener("click", () => runMalicious());
   document.getElementById("btn-mutation")!.addEventListener("click", () => runMutation());
   document.getElementById("btn-workers")!.addEventListener("click", () => runWorkerDemo());
   document.getElementById("btn-mf")!.addEventListener("click", () => runMFDemo());
-  document.getElementById("btn-clear")!.addEventListener("click", () => renderer.clear());
+  document.getElementById("btn-value")!.addEventListener("click", () => runValueDemo());
+  const readMode = (): AttestMode =>
+    (document.getElementById("chk-attest") as HTMLInputElement).checked ? "enforce" : "observe";
+  document.getElementById("btn-attest")!.addEventListener("click", () => {
+    void runAttestedDemo(readMode());
+  });
+  document.getElementById("chk-attest")!.addEventListener("change", () => {
+    // Toggling while the demo runs rolls the fleet over, one microfrontend at a time.
+    if (attestState && !attestState.busy) void rollingRedeploy(readMode());
+  });
+  document.getElementById("btn-clear")!.addEventListener("click", () => {
+    stopValueDemo();
+    attestState = null;
+    valueBoard.clear();
+    renderer.clear();
+  });
 });
