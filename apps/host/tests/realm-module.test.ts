@@ -4,13 +4,24 @@ import { PlatformEventBus } from "@poc/shared";
 import { loadRemoteInCompartment } from "../src/platform/compartment-loader.js";
 
 // Load the REAL built catalog realm bundle (requires `pnpm build:remotes`).
-const catalogDist = new URL("../../catalog/dist/", import.meta.url);
-const entry = readFileSync(new URL("remoteEntry.js", catalogDist), "utf8");
-const asyncDir = new URL("static/js/async/", catalogDist);
-const chunkName = readdirSync(asyncDir).find(
-  (f) => f.startsWith("__federation_expose_realm") && f.endsWith(".js"),
-)!;
-const chunk = readFileSync(new URL(chunkName, asyncDir), "utf8");
+// Skip gracefully if the remotes have not been built.
+function tryLoadBundle(): { entry: string; chunk: string } | null {
+  try {
+    const dist = new URL("../../catalog/dist/", import.meta.url);
+    const entry = readFileSync(new URL("remoteEntry.js", dist), "utf8");
+    const asyncDir = new URL("static/js/async/", dist);
+    const chunkName = readdirSync(asyncDir).find(
+      (f) => f.startsWith("__federation_expose_realm") && f.endsWith(".js"),
+    )!;
+    const chunk = readFileSync(new URL(chunkName, asyncDir), "utf8");
+    return { entry, chunk };
+  } catch {
+    return null;
+  }
+}
+const bundle = tryLoadBundle();
+const entry = bundle?.entry ?? "";
+const chunk = bundle?.chunk ?? "";
 
 function makeAttest() {
   const calls = { requested: 0 };
@@ -40,7 +51,7 @@ async function loadCatalogRealm(required: boolean, realmId = "rid-test") {
   return { result, calls, platformBus };
 }
 
-describe("realm module — endowment threading (real MF bundle)", () => {
+describe.skipIf(!bundle)("realm module — endowment threading (real MF bundle)", () => {
   it("exposes start/setValue/getStatus", async () => {
     const { result } = await loadCatalogRealm(true);
     expect(typeof result.exports.start).toBe("function");

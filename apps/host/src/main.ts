@@ -389,7 +389,12 @@ document.addEventListener("DOMContentLoaded", () => {
           attestService.loadAnchor(CART_ORIGIN),
         ]);
       } catch (err) {
-        renderer.append("host", `⚠ could not load issuer keys: ${String(err)}`);
+        renderer.append(
+          "host",
+          "⚠ could not load issuer keys from :4001/:4002 — are the origin servers serving /issuer.jwk?",
+        );
+        renderer.append("host", "  Run `pnpm demo:attest` (NOT `pnpm demo:mf` / plain `serve`).");
+        renderer.append("host", `  (${String(err)})`);
         return;
       }
     }
@@ -433,6 +438,22 @@ document.addEventListener("DOMContentLoaded", () => {
     // Every realm is now loaded and subscribed — announce (no missed handshakes).
     (catalog.exports.start as () => void)();
     (cart.exports.start as () => void)();
+
+    // Health check: with attestation on, certs should arrive within ~1s. If not,
+    // /attest is unreachable — the usual cause of "attestation doesn't work".
+    if (required) {
+      window.setTimeout(() => {
+        const cs = (catalog.exports.getStatus as () => RealmStatus)();
+        const ts = (cart.exports.getStatus as () => RealmStatus)();
+        if (cs.certStatus !== "ok" || ts.certStatus !== "ok") {
+          renderer.append(
+            "host",
+            "⚠ attestation incomplete (no certificate) — is /attest reachable on :4001/:4002?",
+          );
+          renderer.append("host", "  Restart with `pnpm demo:attest` and hard-refresh.");
+        }
+      }, 1500);
+    }
 
     valueBoard.addCard({
       id: "r-catalog",
